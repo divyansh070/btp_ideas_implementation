@@ -59,3 +59,12 @@ e4:
     epochs: 10
     lr: 0.0001
     batch: 32
+
+e5:                              # text description vs cross-chemistry RUL (paired variants, see qr/e5.py)
+  seeds: [0, 1, 2, 3, 4]
+  regimes: [zero_shot, few_5]
+  variants: [A_none, B_onehot, C_text, D_shuffled, E_text_dyn]   # lstm_frac head, oracle EOL
+  rul_variants: [A_none, C_text]                                  # lstm_rul head, no oracle (vs E4)
+  focus_folds: [LFP, NCA]        # folds with no matching chemistry expert in E3; paired subset (zero-shot)
+  bootstrap: 10000
+  budget_minutes: 70             # drop lstm_rul first, then whole seeds, if the next seed would exceed this

@@ -36,6 +36,7 @@ def smoke_cfg():
     cfg["e2"].update(regimes=["target_only", "zero_shot", "few_1"], epochs=2,
                      models=["lstm_frac", "lstm_rul"] + ([] if MAC else ["lgbm"]))
     cfg["e3"].update(regimes=["zero_shot", "few_1"], epochs_a=1, epochs_b=2, gate_plot_regime="zero_shot")
+    cfg["e5"].update(seeds=[0, 1], regimes=["zero_shot", "few_1"], bootstrap=200)
     return cfg
 
 
@@ -65,8 +66,16 @@ def test_end_to_end(tmp_path):
     assert (last == 0).all() and (hist.groupby(["fold", "regime", "variant", "seed"]).route_w.first() > 0).all()
     # with sets LFP|rest, held-out NCA / LFP have no matching expert; NMC folds keep one via NMC-LCO only in real data
     assert not e3[e3.fold == "NCA"].held_out_has_matching_expert.any()
+    e5 = pd.read_csv(out / "e5_raw.csv")
+    assert set(e5.variant) == {"A_none", "B_onehot", "C_text", "D_shuffled", "E_text_dyn"} and set(e5.seed) == {0, 1}
+    assert set(e5[e5.label == "rul"].variant) == {"A_none", "C_text"} and not e5[e5.label == "rul"].oracle_eol.any()
+    assert e5.code_commit.notna().all() and e5.e5_started.notna().all() and np.isfinite(e5.rmse).all()
+    a = e5[(e5.variant == "A_none") & (e5.label == "frac") & (e5.seed == 0)].set_index(["fold", "regime"]).rmse
+    b = e2[(e2.model == "lstm_frac") & (e2.seed == 0)].set_index(["fold", "regime"]).rmse
+    assert np.allclose(a, b.loc[a.index])                               # A_none is exactly E2 lstm_frac (paired)
     report = (out / "REPORT.md").read_text()
-    for s in ["## E0", "## E1", "## E2", "## E3", "## E4", "oracle", "What this does NOT show"]:
+    for s in ["## E0", "## E1", "## E2", "## E3", "## E4", "## E5", "Paired comparisons", "C_text vs D_shuffled",
+              "oracle", "What this does NOT show"]:
         assert s in report, s
     assert (out / "e1_fraction_of_life.png").exists() and (out / "e3_gate_weights.png").exists()
     assert time.time() - t0 < 60, f"smoke test too slow: {time.time() - t0:.0f}s"
@@ -332,3 +341,34 @@ def test_e4_real_pbt_code_with_tiny_fake_checkpoint(tmp_path):
     assert len(hist) == 1 and notes["e4b_seeds"] == [0]
     ad.reset()
     assert np.allclose(ad.life(name), life, rtol=1e-2)                  # reset restores the pretrained weights
+
+
+
+def test_e5_aux_inputs_paired_stats_and_budget(tmp_path):
+    from qr import e5 as E5
+    from qr.features import prepare
+    p = E5.derangement(50, 3)
+    assert (p != np.arange(50)).all() and sorted(p) == list(range(50)) and (p == E5.derangement(50, 3)).all()
+    qd.make_synthetic(tmp_path)
+    _, kept = qd.load_cells(tmp_path, ["SNL"])
+    prep = prepare(kept, qd.load_text_embeddings(tmp_path), cap=20)
+    oh, dyn = E5.aux_for("B_onehot", prep, "NCA", 0)
+    assert not dyn and oh.shape[1] == 2 and (oh[prep["chem"] == "NCA"] == 0).all() and (oh.sum(1)[prep["chem"] != "NCA"] == 1).all()
+    t, _ = E5.aux_for("C_text", prep, "NCA", 0)
+    sh, _ = E5.aux_for("D_shuffled", prep, "NCA", 0)
+    assert np.allclose(np.linalg.norm(t, axis=1), 1) and not np.allclose(t, sh) and np.allclose(sorted(map(tuple, t)), sorted(map(tuple, sh)))
+    assert E5.aux_for("E_text_dyn", prep, "NCA", 0)[1]
+    # paired stats: x better on every pair -> supported; noise around 0 -> not supported
+    rows = [dict(fold=f, seed=s, regime="zero_shot", label="frac", variant=v, rmse=r)
+            for f in "ab" for s in range(10) for v, r in (("C_text", 90 + s % 3), ("A_none", 100 + s % 2))]
+    r = E5.paired(pd.DataFrame(rows), "C_text", "A_none", regime="zero_shot", n_boot=500)
+    assert r["pairs"] == 20 and r["wins"] == 20 and r["ci95_high"] < 0 and r["verdict"] == "supported"
+    rows = [dict(fold="a", seed=s, regime="zero_shot", label="frac", variant=v, rmse=100 + (s % 2 - 0.5) * (v == "C_text"))
+            for s in range(10) for v in ("C_text", "A_none")]
+    assert E5.paired(pd.DataFrame(rows), "C_text", "A_none", n_boot=500)["verdict"] == "not supported at this scale"
+    # budget guard: drop lstm_rul first, then seeds
+    cfg = smoke_cfg()
+    cfg["folds"] = ["NCA"]
+    cfg["e5"].update(seeds=[0, 1, 2], regimes=["zero_shot"], variants=["A_none"], budget_minutes=0)
+    rows, notes = E5.run_e5(prep, cfg, log=lambda *_: None)
+    assert notes["seeds_done"] == [0] and notes["seeds_reduced"] and notes["rul_dropped_from_seed"] == 1

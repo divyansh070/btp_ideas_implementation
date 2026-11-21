@@ -25,7 +25,7 @@ from qr.metrics import chem_metrics, md_table, summarise
 from qr import train as T
 
 HERE = Path(__file__).parent
-STEPS = ["e0", "e1", "e2", "e3", "e4", "report"]
+STEPS = ["e0", "e1", "e2", "e3", "e4", "e5", "report"]
 
 
 def load_cfg(path, use_hust=False, e4=False):
@@ -243,6 +243,20 @@ def e4(cfg, data_dir, out):
     print("E4:", status.read_text())
 
 
+# ---------------------------------------------------------------- E5
+def e5(cfg, out):
+    if _cached(cfg, "e5", out / "e5_raw.csv"):
+        print("E5: cached")
+        return "cached"
+    _require_gate(cfg, out)
+    from qr.e5 import run_e5
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    rows, notes = run_e5(_prep(out), cfg)
+    stamp = dict(code_commit=cfg["run"]["code_commit"], e5_started=started)
+    (out / "e5_notes.json").write_text(json.dumps(notes | stamp, indent=1))
+    pd.DataFrame([r | stamp for r in rows]).to_csv(out / "e5_raw.csv", index=False)
+
+
 # ---------------------------------------------------------------- report
 DIAGRAM = """```
   cycle data of one cell                               text: 10 ageing factors (PBT prompt)
@@ -349,6 +363,7 @@ def report(cfg, out):
         L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]), e3r)
 
     L += _e4_section(cfg, out, e2r)
+    L += _e5_section(cfg, out, e2r)
 
     L += ["## How Version 1 works end to end", "", DIAGRAM, ""]
     L += ["## What this shows", "",
@@ -369,9 +384,46 @@ def report(cfg, out):
           "not a re-headed windowed-RUL PBT (A3); E4b is our reimplementation of PBT's FT recipe, not finetune_model.py, "
           "with 10 epochs and no hyperparameter search.",
           "- The full Track B model: no Neural ODE, E=2, few epochs, no hyperparameter search, windows subsampled per cell.",
-          "- Any conclusion beyond these folds: the MoE result above is reported as measured, whichever way it goes.", ""]
+          "- Any conclusion beyond these folds: the MoE result above is reported as measured, whichever way it goes.",
+          "- That text helps in general (E5): the embedding is PBT's fixed prompt per cell; with 4 folds x few seeds a "
+          "CI that excludes 0 is evidence at this scale only, and the shuffled-text control (D) is what separates "
+          "'the description is informative' from 'any extra per-cell vector helps'.", ""]
     (out / "REPORT.md").write_text("\n".join(L))
     print("wrote", out / "REPORT.md")
+
+
+def _e5_section(cfg, out, e2r):
+    if not (out / "e5_raw.csv").exists():
+        return []
+    from qr.e5 import paired_table
+    e5r = pd.read_csv(out / "e5_raw.csv")
+    n = json.loads((out / "e5_notes.json").read_text())
+    rt = json.loads((out / "runtime.json").read_text()).get("e5", "n/a") if (out / "runtime.json").exists() else "n/a"
+    L = ["## E5: does a text description of the cell improve cross-chemistry RUL?", "",
+         f"Code commit **{n['code_commit']}**, started {n['e5_started']}; runtime {rt} s; seeds {n['seeds_done']}"
+         + (" (**reduced to fit the time budget**)" if n["seeds_reduced"] else "")
+         + (f"; lstm_rul variants **dropped from seed {n['rul_dropped_from_seed']}** (budget)" if n["rul_dropped_from_seed"]
+            is not None else "") + ".", "",
+         "Same folds, splits, training and E2 lstm_frac model; only the extra input differs (Linear + LeakyReLU -> 32, "
+         "concatenated to z). A none; B one-hot of source chemistries (held-out cells all zeros); C PBT Llama prompt "
+         "embedding (unit length); D shuffled-text control (another cell's embedding, fixed derangement per seed); "
+         "E text + 6 dynamics. Same seed = same cells for every variant (paired). `label=frac` rows use **oracle EOL**; "
+         "`label=rul` rows (A, C only) predict cycles directly, comparable with E4's PBT numbers.", ""]
+    if e2r is not None:
+        a = e5r[(e5r.variant == "A_none") & (e5r.label == "frac")].merge(
+            e2r[e2r.model == "lstm_frac"], on=["fold", "regime", "seed"], suffixes=("", "_e2"))
+        if len(a):
+            L += [f"Sanity: A_none reproduces E2 lstm_frac on the {len(a)} shared fold x regime x seed cells, "
+                  f"max |RMSE difference| = {float((a.rmse - a.rmse_e2).abs().max()):.3g} cycles.", ""]
+    L += [md_table(summarise(e5r, ["fold", "regime", "label", "variant", "oracle_eol"])), ""]
+    pt = paired_table(e5r, cfg)
+    if len(pt):
+        L += ["Paired comparisons on RMSE (cycles): diff = RMSE(first) - RMSE(second), negative = first is better; "
+              f"wins = pairs where the first is better; 95 % CI = bootstrap over pairs ({cfg['e5']['bootstrap']} draws). "
+              "'supported' only if the whole CI is below 0.", "", md_table(pt), ""]
+        L += [f"- {r.comparison} ({r.label}, {r.regime}, folds {r.folds}): {r.wins}/{r.pairs} wins, mean diff "
+              f"{r.mean_rmse_diff:+.1f} [{r.ci95_low:+.1f}, {r.ci95_high:+.1f}] -> **{r.verdict}**." for r in pt.itertuples()]
+    return L + [""]
 
 
 def _e4_section(cfg, out, e2r):
@@ -566,7 +618,8 @@ def main(argv=None, cfg=None):
         if s not in steps:
             continue
         fn = {"e0": lambda: e0(cfg, data_dir, out), "e1": lambda: e1(cfg, out), "e2": lambda: e2(cfg, out),
-              "e3": lambda: e3(cfg, out), "e4": lambda: e4(cfg, data_dir, out), "report": lambda: report(cfg, out)}[s]
+              "e3": lambda: e3(cfg, out), "e4": lambda: e4(cfg, data_dir, out), "e5": lambda: e5(cfg, out),
+              "report": lambda: report(cfg, out)}[s]
         _timed(out, s, fn)
 
 

@@ -43,6 +43,13 @@ on the same 2 / 5 adaptation cells as E2, our loop rather than `finetune_model.p
 dropped if E4 would exceed `budget_minutes`. The report adds a per-fold "Track A gate" verdict vs E2 target-only.
 Failures write their reason to `e4_status.txt` instead of crashing.
 
+**E5, does a text description of the cell help?** E2's `lstm_frac` model with one extra input concatenated to z
+(Linear + LeakyReLU → 32): A none, B one-hot of source chemistries (held-out = zeros), C PBT Llama prompt embedding
+(unit length), D shuffled-text control (another cell's embedding, fixed derangement per seed), E text + 6 dynamics.
+A and C are also run with `lstm_rul` (no oracle) for comparison with E4. Same folds and paired splits, zero-shot and
+few-5, seeds 0-4. The report gives per-variant tables, paired wins and bootstrap 95 % CIs for C vs A / D / B ("supported"
+only if the CI is below 0), and the LFP + NCA zero-shot subset. Budget 70 min: lstm_rul is dropped first, then seeds.
+
 **Caveats.** Fraction-of-life numbers are converted to cycles with the TRUE EOL ("oracle EOL"). Test sets are 3-6 cells. The released
 PBT already saw these chemistries (often these cells: see the E4 leakage table). Model selection uses validation cells only.
 

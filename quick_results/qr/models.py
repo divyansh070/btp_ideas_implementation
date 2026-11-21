@@ -33,12 +33,21 @@ def head(d_in=128, out="sigmoid"):
 
 
 class SingleHead(nn.Module):
-    def __init__(self, n_feat, out="sigmoid"):
-        super().__init__()
-        self.enc, self.head = Encoder(n_feat), head(out=out)
+    """E2 model. E5 adds an optional extra input: aux (+ latent displacement) -> Linear + LeakyReLU -> 32, concatenated
+    to z before the head. With d_aux=0 the modules (and their init order) are exactly E2's."""
 
-    def forward(self, x, *_):
-        return self.head(self.enc(x)[0]).squeeze(-1)
+    def __init__(self, n_feat, out="sigmoid", d_aux=0, aux_disp=False, branch=32):
+        super().__init__()
+        self.enc, self.head = Encoder(n_feat), head(d_in=128 + (branch if d_aux else 0), out=out)
+        self.aux = nn.Sequential(nn.Linear(d_aux + int(aux_disp), branch), nn.LeakyReLU()) if d_aux else None
+        self.aux_disp = aux_disp
+
+    def forward(self, x, aux=None):
+        z, disp = self.enc(x)
+        if self.aux is not None:
+            a = torch.cat([aux, disp], 1) if self.aux_disp else aux
+            z = torch.cat([z, self.aux(a)], 1)
+        return self.head(z).squeeze(-1)
 
 
 class MoE(nn.Module):

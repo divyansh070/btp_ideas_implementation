@@ -41,7 +41,16 @@ def _batches(n, bs, shuffle):
 
 
 # ---------------------------------------------------------------- single head (LSTM -> attention -> LayerNorm head)
-def fit_single(prep, sets, label, cfg, seed):
+def _aux(prep, idx, d, aux_cells, aux_dyn):
+    """E5 extra input per window: a per-cell vector, optionally + the window's scaled dynamics. None for E2."""
+    if aux_cells is None:
+        return None
+    a = aux_cells[prep["cell_idx"][idx]]
+    return _t(np.concatenate([a, d], 1) if aux_dyn else a)
+
+
+def fit_single(prep, sets, label, cfg, seed, aux_cells=None, aux_dyn=False):
+    """E2 single head; E5 passes aux_cells [n_cells, d] (and aux_dyn) for its extra-input variants."""
     tr_c, va_c, fit_c = sets
     set_seed(seed)
     fit = window_idx(prep, fit_c)
@@ -49,17 +58,20 @@ def fit_single(prep, sets, label, cfg, seed):
     data = {}
     for k, cells in (("tr", tr_c), ("va", va_c)):
         idx = window_idx(prep, cells)
-        x, _ = sc.transform(prep["X"][idx], prep["D"][idx])
-        data[k] = (_t(x), _t(target(prep, idx, label, cfg["rul_scale"])))
-    model = SingleHead(prep["X"].shape[-1], "sigmoid" if label == "frac" else "softplus").to(DEV)
+        x, d = sc.transform(prep["X"][idx], prep["D"][idx])
+        data[k] = (_t(x), _t(target(prep, idx, label, cfg["rul_scale"])), _aux(prep, idx, d, aux_cells, aux_dyn))
+    d_aux = 0 if aux_cells is None else aux_cells.shape[1] + (prep["D"].shape[1] if aux_dyn else 0)
+    model = SingleHead(prep["X"].shape[-1], "sigmoid" if label == "frac" else "softplus",
+                       d_aux=d_aux, aux_disp=aux_dyn).to(DEV)
+    model.aux_cells, model.aux_dyn = aux_cells, aux_dyn
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     best, best_state = math.inf, None
     for _ in range(cfg["epochs"]):
         model.train()
-        x, y = data["tr"]
+        x, y, a = data["tr"]
         for b in _batches(len(y), cfg["batch"], True):
             opt.zero_grad()
-            F.mse_loss(model(x[b]), y[b]).backward()
+            F.mse_loss(model(x[b], None if a is None else a[b]), y[b]).backward()
             opt.step()
         v = _mse(model, *data["va"], cfg["batch"])
         if v < best:
@@ -69,18 +81,18 @@ def fit_single(prep, sets, label, cfg, seed):
 
 
 @torch.no_grad()
-def _mse(model, x, y, bs):
+def _mse(model, x, y, a, bs):
     model.eval()
-    p = torch.cat([model(x[b]) for b in _batches(len(y), bs, False)])
+    p = torch.cat([model(x[b], None if a is None else a[b]) for b in _batches(len(y), bs, False)])
     return F.mse_loss(p, y).item()
 
 
 @torch.no_grad()
 def predict_single(model, sc, prep, idx, bs=1024):
     model.eval()
-    x, _ = sc.transform(prep["X"][idx], prep["D"][idx])
-    x = _t(x)
-    return torch.cat([model(x[b]) for b in _batches(len(x), bs, False)]).cpu().numpy()
+    x, d = sc.transform(prep["X"][idx], prep["D"][idx])
+    x, a = _t(x), _aux(prep, idx, d, getattr(model, "aux_cells", None), getattr(model, "aux_dyn", False))
+    return torch.cat([model(x[b], None if a is None else a[b]) for b in _batches(len(x), bs, False)]).cpu().numpy()
 
 
 # ---------------------------------------------------------------- LightGBM on the last sampled cycle's 30 features
