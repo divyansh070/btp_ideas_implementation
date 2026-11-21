@@ -301,7 +301,15 @@ def report(cfg, out):
         L += ["Mean gate weight per chemistry:", "", md_table(gm.reset_index()), ""]
         nomatch = [f for f, m in match.items() if not m]
         L += [f"**Folds where the held-out chemistry has no matching expert: {', '.join(nomatch) or 'none'}.** "
-              "There the hard mask gives the shared expert alone; the additive bias keeps a blend.", ""]
+              "There the hard mask gives the shared expert alone (prediction = f_shared, beta not applied); "
+              "the additive bias keeps a blend.", "",
+              "How `held_out_has_matching_expert` is decided (`qr/train.py` expert_sets / match_matrix): each fold has "
+              "E = 2 experts built from that fold's source chemistries (LFP vs rest; NMC vs rest when LFP is held out). "
+              "A chemistry's cathode components are its name split on '-' (NMC-LCO -> {NMC, LCO}). A cell matches an "
+              "expert when its components overlap the union of that expert's components. HNEI (NMC-LCO) is always a "
+              "source cell, so it puts NMC and LCO into the 'rest' expert: held-out NMC and LCO match it (partial "
+              "match through NMC-LCO), while held-out NCA and LFP share no component with any expert.", "",
+              md_table(_match_table(prep, cfg["folds"])), ""]
         L += _moe_vs_single(both, nomatch)
 
     status = (out / "e4_status.txt").read_text() if (out / "e4_status.txt").exists() else "not run"
@@ -330,6 +338,19 @@ def report(cfg, out):
           "- Any conclusion beyond these folds: the MoE result above is reported as measured, whichever way it goes.", ""]
     (out / "REPORT.md").write_text("\n".join(L))
     print("wrote", out / "REPORT.md")
+
+
+def _match_table(prep, folds):
+    rows = []
+    for held in folds:
+        sets = T.expert_sets(sorted(set(prep["chem"]) - {held}))
+        comps = [sorted(set().union(*map(T.components, st))) for st in sets]
+        hit = [e for e, c in enumerate(comps) if T.components(held) & set(c)]
+        rows.append(dict(fold=held, experts=" ; ".join("+".join(sorted(st)) for st in sets),
+                         expert_components=" ; ".join("+".join(c) for c in comps),
+                         held_out_components="+".join(sorted(T.components(held))),
+                         matching_expert=", ".join(f"e{e}" for e in hit) or "none"))
+    return pd.DataFrame(rows)
 
 
 def _gap_lines(e2r):

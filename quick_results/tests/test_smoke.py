@@ -152,3 +152,24 @@ def test_fetch_resumes_and_verifies(tmp_path):
         assert not (tmp_path / "g.zip").exists()
     finally:
         srv.shutdown()
+
+
+def test_moe_mask_without_match_is_shared_only_and_beta_trains():
+    import torch
+    from qr.models import MoE
+    torch.manual_seed(0)
+    m = MoE(n_feat=25, d_text=16, n_dyn=5, n_experts=2, bias=2.0)
+    x, d, txt = torch.randn(4, 10, 25), torch.randn(4, 5), torch.randn(4, 16)
+    match = torch.tensor([[1., 0.], [0., 1.], [0., 0.], [0., 0.]])     # rows 2-3: no matching specialist
+    with torch.no_grad():
+        m.beta_logit.fill_(0.3)                                         # beta != 0.5, so a (1-beta)/beta mix would show
+    o = m(x, d, txt, match, 1.0, "mask")
+    assert torch.equal(o["g"][2:], torch.zeros(2, 2))
+    assert torch.allclose(o["pred"][2:], o["fs"][2:])                   # f_shared alone, not beta * f_shared
+    blend = (1 - o["beta"]) * (o["g"][:2] * o["f"][:2]).sum(1) + o["beta"] * o["fs"][:2]
+    assert torch.allclose(o["pred"][:2], blend)
+    # beta: a trainable parameter with gradient, no clamp (sigmoid of an unbounded logit)
+    assert m.beta_logit.requires_grad and any(p is m.beta_logit for p in m.parameters())
+    o = m(x, d, txt, match, 1.0, "bias")
+    torch.nn.functional.mse_loss(o["pred"], torch.rand(4)).backward()
+    assert m.beta_logit.grad is not None and m.beta_logit.grad.abs().item() > 0
