@@ -239,3 +239,9 @@
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 9 passed, 1 skipped (LightGBM, macOS), 20 s. Nothing rerun on Colab (per user).
 - Assumptions / risks: AT lr 2.5e-5 is my choice (the user fixed FT lr only). AT's adapters are PBT's default init (not identity), so AT epoch -1 ≠ pretrained; zero-shot remains a separate candidate. E4b now does 2 methods, so roughly 2× its previous runtime; the budget guard may drop seeds.
 - Commit: "fix(quick_results): E4b epoch-0 candidate, FT lr 1e-5, AT, leakage-aware gate (document.md)"
+
+### 2026-11-21 23:04 — Commit E3 run-2 report (outputs_run2/REPORT.md)
+- Changed: quick_results/outputs_run2/REPORT.md (new; user's Colab report, moved from the untracked outputs_run1/REPORT_e3.md). outputs_run1/ unchanged (REPORT.md only).
+- Why: preserve run 2 (E3 at commit 7c7387b, started 2026-11-21T15:58:50Z, e3 runtime 1548 s). It is a real rerun: MoE numbers differ from run 1; source gate entropy (bias) 0.21–0.39 vs ~0.01 in run 1; raw text-embedding norm ≈ 148 (confirms the unscaled-embedding hypothesis); accuracy essentially unchanged (moe_bias beats single head in 5/12 cells, moe_mask 6/12, mostly within 1 std).
+- Verified by: `grep "code commit" outputs_run2/REPORT.md` → 7c7387b in the setup and the E3 section.
+- Commit: "results: E3 run 2 report (outputs_run2/REPORT.md)"
