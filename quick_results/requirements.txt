@@ -1,0 +1,13 @@
+# Lower-bounded so Colab keeps its preinstalled builds (torch with CUDA, numpy, pandas, ...); pip only adds what is missing.
+# Verified locally (Mac, CPU) with the versions in requirements-lock-mac.txt; Colab versions are not pinned exactly.
+torch>=2.2
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+matplotlib>=3.8
+pyyaml>=6.0
+lightgbm>=4.3
+scikit-learn>=1.3   # lightgbm.sklearn API
+# E4 only (released PBT): huggingface_hub, accelerate, transformers are preinstalled on Colab; PBT also needs these
+# pip install reformer_pytorch==1.4.4 denseweight joblib
+pytest>=8.0

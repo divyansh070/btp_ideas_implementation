@@ -118,3 +118,16 @@
 - Verified by: smoke test, see the run_all entry below.
 - Assumptions / risks: see the four quick_results Known issues (30-feature definition, percentile range check, Qd_min std, expert sets). Downloads use Zenodo per-file URLs (api/records/<id>/files/<name>/content) and figshare file 63780003 ("Life labels.zip"); zip internal layout unknown, so members are matched by basename. Windows capped at 150 per cell (evenly spaced) for the < 1 h runtime target. Every frac→cycles number uses the TRUE EOL and is marked oracle_eol=True: **leak flagged** (CLAUDE.md), acceptable only as a PoC upper bound; lstm_rul is the non-oracle reference. E4 is untested end to end (needs gated Llama tokenizer).
 - Commit: "quick_results: qr package and config (document.md)"
+
+### 2026-11-21 16:49 — quick_results: run_all.py, smoke test, requirements (incl. failed attempts)
+- Changed: quick_results/run_all.py, quick_results/tests/test_smoke.py, quick_results/requirements.txt, quick_results/requirements-lock-mac.txt (new); quick_results/.venv (gitignored, uv, Python 3.11)
+- Why: brief: run_all E0-E4 + REPORT.md with skip-if-CSV-exists; synthetic end-to-end smoke test (6 cells, 3 chemistries, CPU, < 1 min).
+- Failed attempts and fixes:
+  1. Smoke config still requested CALCE/HNEI → FileNotFoundError "no CALCE pickles" (fail-loud path working). Fix: smoke datasets = [SNL].
+  2. LightGBM sklearn API → "scikit-learn is required for lightgbm.sklearn". Fix: scikit-learn added to requirements.
+  3. Gate "min feature std > 0.01" failed on synthetic cells (constant current). Fix: synthetic current varies with fade; the gate now names the features (still flags I_C_mean/median, Qd_min/median, d_I_C_mean, d_Qd_min on synthetic data; smoke uses allow_fail). See Known issues re Qd_min on real data.
+  4. **Segfault (exit 139)** in LightGBM Dataset construction: torch bundles libomp, LightGBM links Homebrew libomp (rpath /opt/homebrew/opt/libomp/lib). Importing lightgbm first moved the crash into torch's LSTM. OMP_NUM_THREADS=1 avoided it from the shell but not reliably in-process. Per user: macOS-only, Colab/Linux unaffected → LightGBM skipped in the smoke test on darwin (pytest.mark.skipif + lgbm removed from the darwin E2 model list); the workaround code was removed.
+  5. torch.cat on empty list: with 2 cells per chemistry, source val is empty for zero-shot. Fix: regime_sets falls back to the train cells when no validation cell exists (only possible with < 3 cells per chemistry, never with real data); E3 skips source-val gate logging when empty.
+- Verified by: `cd quick_results && .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_smoke.py` → 2 passed, 1 skipped (LightGBM, macOS), ~4 s.
+- Assumptions / risks: requirements.txt uses lower bounds so Colab keeps its preinstalled CUDA torch; exact Colab versions are not verified from here.
+- Commit: "quick_results: run_all, smoke test, requirements (document.md)"
