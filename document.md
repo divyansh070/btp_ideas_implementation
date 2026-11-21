@@ -16,6 +16,9 @@
 - Design guide says SNL, UL-PUR, HNEI need access requests, but processed versions are open (CC-BY-4.0) in BatteryLife v9 (Zenodo 17958489). Confirm whether we use BatteryLife-processed data or raw sources.
 - PBT doc §4.7 says the output head is "five general linear layers plus five gated"; code builds 5 gated (top-2) + **1** general (`models/PBT.py:561-565`, `:397`). Re-check against the released args.json once downloaded.
 - Docs: the pptx named in CLAUDE.md (`docs/*.pptx`) is not in docs/.
+- A2 acceptance band for HNEI (0.033 ± 0.010, 3 seeds, MAPE@20 cycles) is a proposal (docs/PLAN_track_A.md); needs user OK. D4 "measurable gap" definition also proposed there.
+- PBT's per-dataset numbers in the main Fig. 4 are bars only (not readable as text); A2 targets come from Supp. Table 2 (first 20 cycles), not Fig. 4.
+- Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
 
 ## Log
 
@@ -82,3 +85,11 @@
   - BatteryLife v9 data, Zenodo 17958489: open, our 8 datasets = 8.01 GB (> 1 GB → ask before downloading). Life labels: figshare 31148413, open.
 - Assumptions / risks: MPS fine-tune feasibility and the RAM estimate are untested.
 - Commit: "env: uv venv for PBT, requirements.lock (document.md)"
+
+### 2026-11-21 16:25 — Track A plan (docs/PLAN_track_A.md)
+- Changed: docs/PLAN_track_A.md (new); document.md Known issues (A2 band, Fig. 4 vs Supp. Table 2, seeds)
+- Why: brief step 4; guide §4 (pipeline + gate), §5 (A1–A5, week-6 gate), §6.8 (protocol).
+- Verified by: A2 target read from arXiv:2512.16334 v4 PDF (fetched; text extracted with PyMuPDF), Supplementary Table 2 p. 40: PBT-TL test MAPE, first 20 cycles, ± over 3 runs. HNEI 0.033±0.002 (9 train), MATR 0.077±0.006 (102), XJTU 0.055±0.010 (15), RWTH 0.082±0.003 (30), HUST 0.098±0.014 (47), SNL 0.143±0.006 (30), CALCE 0.191±0.056 (9). Training-cell counts equal PBT's recorded split, so the repo split = paper split. Eval at fixed 20 cycles = `evaluate_model.py --eval_cycle_min 20 --eval_cycle_max 20` (third_party/PBT/scripts/evaluate_model.sh:13-14).
+- Failed attempt: web-fetch of arxiv.org/html/2512.16334v4 → 404; the fetch tool could not parse the PDF bytes. Fix: extracted the saved PDF locally with PyMuPDF (`python3 -I`).
+- Assumptions / risks: the v4 numbers may differ in v5–v7 / the EES journal version (latest arXiv v7, 30 Sep 2026). A2 band, D1–D4 are proposals awaiting the user.
+- Commit: "docs: Track A plan with A2 target (docs/PLAN_track_A.md)"
