@@ -184,3 +184,38 @@ def test_moe_mask_without_match_is_shared_only_and_beta_trains():
         m.eval()
         a, b = m(x, d, txt, match, 1.0, "bias"), m(x, d, 100 * txt, match, 1.0, "bias")
     assert torch.allclose(a["logits"], b["logits"], atol=1e-5)
+
+
+def test_cached_e3_is_marked_and_force_reruns(tmp_path, monkeypatch):
+    import json
+    data, out = tmp_path / "data", tmp_path / "out"
+    qd.make_synthetic(data)
+    cfg = smoke_cfg()
+    args = ["--data", str(data), "--out", str(out), "--steps", "e0,e3,report"]
+    run_all.main(args, cfg=cfg)
+    first = pd.read_csv(out / "e3_raw.csv")
+    assert first.code_commit.notna().all() and first.e3_started.notna().all()
+    assert isinstance(json.loads((out / "runtime.json").read_text())["e3"], float)
+
+    run_all.main(args, cfg=smoke_cfg())                                   # outputs exist: skipped
+    rt = json.loads((out / "runtime.json").read_text())
+    assert rt["e3"] == "cached" and rt["e0"] == "cached"
+    assert pd.read_csv(out / "e3_raw.csv").e3_started.equals(first.e3_started)
+
+    import time
+    time.sleep(1.1)                                                       # e3_started has 1 s resolution
+    run_all.main(args + ["--force", "e3"], cfg=smoke_cfg())              # --force reruns despite the CSV
+    rt = json.loads((out / "runtime.json").read_text())
+    assert isinstance(rt["e3"], float) and rt["e0"] == "cached"
+    assert not pd.read_csv(out / "e3_raw.csv").e3_started.equals(first.e3_started)
+
+    # a "run 1" report from the same commit must not be presented as run 1 vs run 2
+    run1 = tmp_path / "run1" / "REPORT.md"
+    run1.parent.mkdir()
+    run1.write_text((out / "REPORT.md").read_text())
+    monkeypatch.setattr(run_all, "RUN1", run1)
+    run_all.main(["--data", str(data), "--out", str(out), "--steps", "report"], cfg=smoke_cfg())
+    rep = (out / "REPORT.md").read_text()
+    assert "Not labelled as run 2" in rep and "### E3 run 1 vs run 2" not in rep
+    with pytest.raises(SystemExit):
+        run_all.main(args + ["--force", "e9"], cfg=smoke_cfg())

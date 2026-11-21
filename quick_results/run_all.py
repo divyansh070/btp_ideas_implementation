@@ -8,6 +8,7 @@ import argparse
 import json
 import pickle
 import platform
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -38,21 +39,24 @@ def load_cfg(path, use_hust=False, e4=False):
     return cfg
 
 
+def _cached(cfg, step, *paths):
+    """A step is skipped only if all its outputs exist and it was not named in --force."""
+    return step not in cfg["run"]["force"] and all(p.exists() for p in paths)
+
+
 def _timed(out, name, fn):
     t0 = time.time()
     r = fn()
-    if r == "cached":  # keep the runtime of the run that produced the CSV
-        return r
     rt = out / "runtime.json"
     d = json.loads(rt.read_text()) if rt.exists() else {}
-    d[name] = round(time.time() - t0, 1)
+    d[name] = "cached" if r == "cached" else round(time.time() - t0, 1)  # this invocation only
     rt.write_text(json.dumps(d, indent=1))
     return r
 
 
 # ---------------------------------------------------------------- E0
 def e0(cfg, data_dir, out):
-    if (out / "e0_gate.csv").exists() and (out / "prepared.pkl").exists():
+    if _cached(cfg, "e0", out / "e0_gate.csv", out / "prepared.pkl"):
         print("E0: cached")
         return "cached"
     ds = cfg["data"]["datasets"]
@@ -102,7 +106,7 @@ def _require_gate(cfg, out):
 
 # ---------------------------------------------------------------- E1
 def e1(cfg, out):
-    if (out / "e1_life.csv").exists():
+    if _cached(cfg, "e1", out / "e1_life.csv"):
         print("E1: cached")
         return "cached"
     prep = _prep(out)
@@ -119,7 +123,7 @@ def e1(cfg, out):
 
 # ---------------------------------------------------------------- E2
 def e2(cfg, out):
-    if (out / "e2_raw.csv").exists():
+    if _cached(cfg, "e2", out / "e2_raw.csv"):
         print("E2: cached")
         return "cached"
     _require_gate(cfg, out)
@@ -154,12 +158,13 @@ def _n_target(train_cells, sp):
 
 # ---------------------------------------------------------------- E3
 def e3(cfg, out):
-    if (out / "e3_raw.csv").exists():
+    if _cached(cfg, "e3", out / "e3_raw.csv"):
         print("E3: cached")
         return "cached"
     _require_gate(cfg, out)
     prep, c = _prep(out), cfg["e3"]
     rows, gates, hist = [], [], []
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     for seed in cfg["seeds"]:
         for held in cfg["folds"]:
             sp = make_split(prep["chem"], held, seed, cfg["split"])
@@ -176,6 +181,7 @@ def e3(cfg, out):
                     experts = " | ".join("+".join(sorted(s)) for s in fit["sets"])
                     has_match = bool(match.sum(1).max() > 0)
                     rows.append(dict(fold=held, regime=regime, model=f"moe_{v}", seed=seed, oracle_eol=True,
+                                     code_commit=cfg["run"]["code_commit"], e3_started=started,
                                      experts=experts, held_out_has_matching_expert=has_match,
                                      selected_epoch=sel["epoch"], **{k: sel[k] for k in sel if k not in ("epoch",)},
                                      **chem_metrics(prep["rul"][test], pred * prep["eol"][test], prep["cell_idx"][test])))
@@ -197,7 +203,7 @@ def e3(cfg, out):
 # ---------------------------------------------------------------- E4
 def e4(cfg, data_dir, out):
     status = out / "e4_status.txt"
-    if status.exists():
+    if _cached(cfg, "e4", status):
         print("E4: cached")
         return "cached"
     if not cfg["e4"]["enabled"]:
@@ -246,7 +252,7 @@ def report(cfg, out):
           "- Selection: best epoch on validation cells only (source val for zero-shot; source val + target val otherwise). "
           "The blind test is only scored.",
           f"- Runtime (s): {rt}; host: {platform.node()} / torch device {T.DEV}; code commit "
-          f"{yaml.safe_load((out / 'config_used.yaml').read_text()).get('code_commit', 'unknown')}.", ""]
+          f"{cfg.get('run', {}).get('code_commit', 'unknown')}.", ""]
     if (out / "e0_dropped_cells.csv").exists():
         dr = pd.read_csv(out / "e0_dropped_cells.csv")
         by = "; ".join(f"{n} {r}" for r, n in dr.reason.value_counts().items()) if len(dr) else "none"
@@ -314,7 +320,7 @@ def report(cfg, out):
               "match through NMC-LCO), while held-out NCA and LFP share no component with any expert.", "",
               md_table(_match_table(prep, cfg["folds"])), ""]
         L += _moe_vs_single(both, nomatch)
-        L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]))
+        L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]), e3r)
 
     status = (out / "e4_status.txt").read_text() if (out / "e4_status.txt").exists() else "not run"
     L += ["## E4: released PBT, zero-shot", "", f"Status: {status}", ""]
@@ -373,22 +379,45 @@ def _md_section_table(path, heading):
     return pd.DataFrame(rows[2:], columns=rows[0])
 
 
-def _run1_vs_run2(run2):
+RUN1_COMMIT = "d7588be"  # run 1 predates commit stamping; inferred in document.md (25-feature diagram, no match table)
+
+
+def _e3_provenance(e3r):
+    if "code_commit" not in e3r:
+        return None, None
+    return ", ".join(sorted(set(e3r.code_commit.astype(str)))), ", ".join(sorted(set(e3r.e3_started.astype(str))))
+
+
+def _run1_vs_run2(run2, e3r):
+    commit, started = _e3_provenance(e3r)
+    head = [f"E3 results in this report: code commit **{commit or 'not recorded'}**, started {started or 'not recorded'}.", ""]
     if not RUN1.exists():
-        return []
+        return head
+    m1 = re.search(r"code commit ([0-9a-f]{7,})", RUN1.read_text())
+    run1_commit = m1.group(1) if m1 else RUN1_COMMIT
     try:
         run1 = _md_section_table(RUN1, "## E3")
     except (StopIteration, ValueError) as e:
-        return [f"Run-1 comparison skipped: could not read the E3 table in {RUN1.name} ({e}).", ""]
-    keys = ["fold", "regime", "model"]
-    m = run1[keys + ["rmse", "r2", "mape50"]].merge(run2[keys + ["rmse", "r2", "mape50"]], on=keys, how="outer",
-                                                     suffixes=(" run1", " run2"))
-    m = m[keys + [f"{c} {r}" for c in ("rmse", "r2", "mape50") for r in ("run1", "run2")]].fillna("n/a")
-    return ["### E3 run 1 vs run 2", "",
-            "Run 2 differs from run 1 only by the unit-length normalisation of the text embedding at the router "
-            "input (`qr/models.py`, MoE.forward). Same prepared.pkl, config, seeds and splits. The added per-epoch "
-            "logging does not change training. `single_head` rows come from E2, so they are identical by construction. "
-            "Run 1 is read from `outputs_run1/REPORT.md`.", "", md_table(m), ""]
+        return head + [f"Run-1 comparison skipped: could not read the E3 table in {RUN1.name} ({e}).", ""]
+    keys, met = ["fold", "regime", "model"], ["rmse", "r2", "mape50"]
+    m = run1[keys + met].merge(run2[keys + met], on=keys, how="outer", suffixes=(" run1", " this"))
+    moe = m[m.model.str.startswith("moe_")]
+    identical = len(moe) > 0 and all((moe[f"{c} run1"] == moe[f"{c} this"]).all() for c in met)
+    refuse = (None if commit and commit != run1_commit and not identical else
+              "E3 results carry no code-commit stamp, so they predate this check and may be cached from run 1"
+              if not commit else
+              f"E3 results come from commit {commit}, the same as run 1 ({run1_commit})"
+              if commit == run1_commit else
+              "every MoE number equals run 1 to the last digit, which means E3 was almost certainly skipped as cached")
+    if refuse:
+        return head + [f"**Not labelled as run 2: {refuse}. Rerun with `--force e3`.**", ""]
+    m = m[keys + [f"{c} {r}" for c in met for r in ("run1", "this")]].fillna("n/a")
+    m.columns = [c.replace(" this", " run2") for c in m.columns]
+    return head + ["### E3 run 1 vs run 2", "",
+                   f"Run 1: commit {run1_commit} (`outputs_run1/REPORT.md`). Run 2: commit {commit}. Run 2 differs from "
+                   "run 1 only by the unit-length normalisation of the text embedding at the router input "
+                   "(`qr/models.py`, MoE.forward); same prepared.pkl, config, seeds and splits. `single_head` rows come "
+                   "from E2 and are identical by construction.", "", md_table(m), ""]
 
 
 def _gap_lines(e2r):
@@ -428,6 +457,7 @@ def main(argv=None, cfg=None):
     ap.add_argument("--use-hust", action="store_true")
     ap.add_argument("--e4", action="store_true")
     ap.add_argument("--allow-gate-fail", action="store_true", help="train even if a gate check fails (report shows FAIL)")
+    ap.add_argument("--force", default="", help="comma-separated steps to rerun even if their outputs exist, e.g. e3")
     a = ap.parse_args(argv)
     cfg = cfg or load_cfg(a.config, a.use_hust, a.e4)
     cfg["gate"]["allow_fail"] = cfg["gate"]["allow_fail"] or a.allow_gate_fail
@@ -438,7 +468,12 @@ def main(argv=None, cfg=None):
                                 text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         commit = "unknown"
-    (out / "config_used.yaml").write_text(yaml.safe_dump(cfg | {"code_commit": commit}, sort_keys=False))
+    force = [f for f in a.force.split(",") if f]
+    bad = set(force) - set(STEPS)
+    if bad:
+        raise SystemExit(f"--force: unknown step(s) {sorted(bad)}; choose from {STEPS}")
+    cfg["run"] = dict(code_commit=commit, force=force, invoked=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    (out / "config_used.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     if a.download:
         qd.download(data_dir, cfg["data"]["datasets"], pbt_ckpt=cfg["e4"]["enabled"])
     steps = a.steps.split(",")

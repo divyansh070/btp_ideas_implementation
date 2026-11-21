@@ -30,7 +30,7 @@
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
 - quick_results E3: HNEI (NMC-LCO) is always a source cell; its components {NMC, LCO} give held-out NMC and LCO a partial cathode match, so only the LFP and NCA folds have no matching expert. Neural ODE omitted.
 - quick_results: other possibly-constant features, NOT dropped, awaiting user decision. `Qd_median` is constant by construction if Qd is 0 during charge and charge takes ≥ 50 % of a cycle's samples (likely, unverified on real data). Inside one cell, protocol-fixed features (`V_max`, `I_C_min`, `I_C_max`, `I_C_median`) and their deltas barely move; they vary across cells, so the std gate does not catch them. E0 now writes `e0_feature_constancy.csv` to settle this on real data.
-- quick_results E3 run 2 pending: does unit-length text normalisation remove the near one-hot source gates (run 1 entropy ~0.01)? Check gate_entropy_source / logit_gap_over_tau_source and text_norm_raw_* in e3_history.csv.
+- quick_results E3 run 2 pending: does unit-length text normalisation remove the near one-hot source gates (run 1 entropy ~0.01)? Check gate_entropy_source / logit_gap_over_tau_source and text_norm_raw_* in e3_history.csv. **First run-2 attempt was not a run:** E3 was skipped as cached (every E3 digit identical to run 1, runtime e3=1684.3 copied). Rerun with the notebook's E3 cell, which now uses `--force e3`.
 
 ## Log
 
@@ -192,3 +192,15 @@
 - Run-1 provenance: outputs_run1/REPORT.md has the 25-feature diagram and lacks the matching table from 253c496 ⇒ run 1 used d7588be. d7588be → this commit changes model code only by the normalisation; seeds, config and prepared.pkl are unchanged, and the added eval-time logging uses no RNG. So run 2 differs from run 1 only by the normalisation. Run-1 totals: E0 272 s, E2 512 s, E3 1684 s on T4.
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 5 passed, 1 skipped (LightGBM, macOS). Synthetic run renders "### E3 run 1 vs run 2" (run-1 rows read from outputs_run1, run-2 n/a because the synthetic folds differ) and "code commit 253c496" in setup.
 - Commit: "quick_results: unit-length text embedding, routing log, run1 vs run2 (document.md)"
+
+### 2026-11-21 21:09 — FIX: cached E3 passed off as run 2 (commit stamp, runtime "cached", --force)
+- Error (Colab, user): the run-2 REPORT matched run 1 in every E3 digit, and runtime.json still said e3 = 1684.3 s (run 1's value). E3 had been skipped because e3_raw.csv existed, and _timed deliberately kept the old runtime for cached steps, which hid the skip. The report then labelled the cached numbers "run 2".
+- Changed: quick_results/run_all.py:
+  - every cache check goes through `_cached(cfg, step, *paths)`; new `--force e0,..,e4` (unknown step names → SystemExit);
+  - runtime.json records this invocation only: seconds for executed steps, "cached" for skipped ones;
+  - e3_raw.csv rows carry code_commit + e3_started; config_used.yaml has run.code_commit / force / invoked;
+  - the REPORT E3 section states the E3 commit and start time, and labels "E3 run 1 vs run 2" only if the E3 commit is recorded, differs from run 1's (read from run-1 REPORT if present, else RUN1_COMMIT = d7588be, inferred earlier) and the MoE numbers are not identical to run 1. Otherwise it prints "Not labelled as run 2: <reason>. Rerun with --force e3."
+  - quick_results_colab.ipynb E3 cell: `--steps e3 --force e3`. tests/test_smoke.py: test_cached_e3_is_marked_and_force_reruns (2nd run → e3 "cached" and e3_started unchanged; --force e3 → numeric runtime and new e3_started; same-commit run-1 report → refusal text; --force e9 → SystemExit).
+- Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 6 passed, 1 skipped (LightGBM, macOS), 9.7 s.
+- Assumptions / risks: the commit check uses git HEAD of the Colab clone; uncommitted local edits are not distinguished (Colab runs pushed code only).
+- Commit: "fix(quick_results): stamp E3 with commit, mark cached steps, --force (document.md)"
