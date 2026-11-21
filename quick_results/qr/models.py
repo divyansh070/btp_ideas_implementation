@@ -24,21 +24,22 @@ class Encoder(nn.Module):
         return z, disp
 
 
-def head(d_in=128, out="sigmoid"):
-    """128 -> 64 -> 32 -> 1, LayerNorm (never BatchNorm), dropout 0.1."""
+def head(d_in=128, out="sigmoid", h1=64, h2=32):
+    """128 -> 64 -> 32 -> 1, LayerNorm (never BatchNorm), dropout 0.1. h1/h2 only change for E3 v2's matched head."""
     act = nn.Sigmoid() if out == "sigmoid" else nn.Softplus()
-    return nn.Sequential(nn.Linear(d_in, 64), nn.LayerNorm(64), nn.ReLU(), nn.Dropout(0.1),
-                         nn.Linear(64, 32), nn.LayerNorm(32), nn.ReLU(), nn.Dropout(0.1),
-                         nn.Linear(32, 1), act)
+    return nn.Sequential(nn.Linear(d_in, h1), nn.LayerNorm(h1), nn.ReLU(), nn.Dropout(0.1),
+                         nn.Linear(h1, h2), nn.LayerNorm(h2), nn.ReLU(), nn.Dropout(0.1),
+                         nn.Linear(h2, 1), act)
 
 
 class SingleHead(nn.Module):
     """E2 model. E5 adds an optional extra input: aux (+ latent displacement) -> Linear + LeakyReLU -> 32, concatenated
     to z before the head. With d_aux=0 the modules (and their init order) are exactly E2's."""
 
-    def __init__(self, n_feat, out="sigmoid", d_aux=0, aux_disp=False, branch=32):
+    def __init__(self, n_feat, out="sigmoid", d_aux=0, aux_disp=False, branch=32, width=64):
         super().__init__()
-        self.enc, self.head = Encoder(n_feat), head(d_in=128 + (branch if d_aux else 0), out=out)
+        self.enc = Encoder(n_feat)
+        self.head = head(d_in=128 + (branch if d_aux else 0), out=out, h1=width, h2=max(width // 2, 1))
         self.aux = nn.Sequential(nn.Linear(d_aux + int(aux_disp), branch), nn.LeakyReLU()) if d_aux else None
         self.aux_disp = aux_disp
 
@@ -84,3 +85,18 @@ class MoE(nn.Module):
         if mode == "mask":          # no matching specialist: shared expert alone (PBT: general experts only)
             pred = torch.where(match.sum(1) == 0, fs, pred)
         return dict(pred=pred, g=g, f=f, fs=fs, z=z, logits=logits, beta=beta)
+
+    def add_expert(self, init):
+        """E3 v2 few-shot: spawn one expert for the held-out chemistry, a copy of the shared expert (init="shared")
+        or of expert `init` (an index). The router's output layer gains one row: a copy of expert `init`'s row, or
+        the mean row for "shared"; existing experts' logits are unchanged."""
+        import copy
+        self.experts.append(copy.deepcopy(self.shared if init == "shared" else self.experts[init]))
+        old = self.router[-1]
+        new = nn.Linear(old.in_features, old.out_features + 1).to(old.weight.device)
+        with torch.no_grad():
+            new.weight[:-1], new.bias[:-1] = old.weight, old.bias
+            new.weight[-1] = old.weight.mean(0) if init == "shared" else old.weight[init]
+            new.bias[-1] = old.bias.mean() if init == "shared" else old.bias[init]
+        self.router[-1] = new
+        self.E += 1

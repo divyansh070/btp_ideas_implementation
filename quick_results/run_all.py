@@ -25,7 +25,7 @@ from qr.metrics import chem_metrics, md_table, summarise
 from qr import train as T
 
 HERE = Path(__file__).parent
-STEPS = ["e0", "e1", "e2", "e3", "e4", "e5", "report"]
+STEPS = ["e0", "e1", "e2", "e3", "e3v2", "e4", "e5", "report"]
 
 
 def load_cfg(path, use_hust=False, e4=False):
@@ -36,6 +36,9 @@ def load_cfg(path, use_hust=False, e4=False):
         for k, v in cfg["expected_counts_hust_extra"].items():
             cfg["expected_counts"][k] = cfg["expected_counts"].get(k, 0) + v
     cfg["e4"]["enabled"] = e4 or cfg["e4"]["enabled"]
+    v2 = HERE / "configs" / "e3v2.yaml"  # pre-registered E3 v2 protocol, kept in its own file
+    if v2.exists() and "e3v2" not in cfg:
+        cfg["e3v2"] = yaml.safe_load(v2.read_text())
     if not cfg["e4"].get("pbt_repo"):
         cfg["e4"]["pbt_repo"] = str(HERE.parent / "third_party" / "PBT")  # gitignored; absent on Colab -> clone
     return cfg
@@ -243,6 +246,36 @@ def e4(cfg, data_dir, out):
     print("E4:", status.read_text())
 
 
+# ---------------------------------------------------------------- E3 v2
+def _git(*args):
+    try:
+        return subprocess.run(["git", "-C", str(HERE), *args], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _grid_commit():
+    """Last commit of the pre-registered grid, or NOT COMMITTED (also if it has uncommitted edits)."""
+    c = _git("log", "-1", "--format=%h %cI", "--", "configs/e3v2.yaml")
+    dirty = _git("status", "--porcelain", "--", "configs/e3v2.yaml")
+    return "NOT COMMITTED" if not c or c == "unknown" or dirty else c
+
+
+def e3v2(cfg, out):
+    if _cached(cfg, "e3v2", out / "e3v2_raw.csv"):
+        print("E3v2: cached")
+        return "cached"
+    _require_gate(cfg, out)
+    from qr.e3v2 import run_e3v2
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    rows, cfg_rows, notes = run_e3v2(_prep(out), cfg)
+    stamp = dict(code_commit=cfg["run"]["code_commit"], e3v2_started=started,
+                 grid_commit=_grid_commit())
+    (out / "e3v2_notes.json").write_text(json.dumps(notes | stamp, indent=1))
+    pd.DataFrame(cfg_rows).to_csv(out / "e3v2_configs.csv", index=False)
+    pd.DataFrame([r | stamp for r in rows]).to_csv(out / "e3v2_raw.csv", index=False)
+
+
 # ---------------------------------------------------------------- E5
 def e5(cfg, out):
     if _cached(cfg, "e5", out / "e5_raw.csv"):
@@ -362,6 +395,7 @@ def report(cfg, out):
         L += _moe_vs_single(both, nomatch)
         L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]), e3r)
 
+    L += _e3v2_section(cfg, out)
     L += _e4_section(cfg, out, e2r)
     L += _e5_section(cfg, out, e2r)
 
@@ -391,6 +425,63 @@ def report(cfg, out):
           "'the description is informative' from 'any extra per-cell vector helps'.", ""]
     (out / "REPORT.md").write_text("\n".join(L))
     print("wrote", out / "REPORT.md")
+
+
+def _prereg_warning(n):
+    g = n["grid_commit"]
+    if g == "NOT COMMITTED":
+        return ". **WARNING: grid not committed (or edited) when E3 v2 ran: NOT pre-registered**"
+    try:
+        when = pd.Timestamp(g.split()[1])
+        if when > pd.Timestamp(n["e3v2_started"]):
+            return ". **WARNING: grid committed after the run started: NOT pre-registered**"
+    except (IndexError, ValueError):
+        pass
+    return ""
+
+
+def _e3v2_section(cfg, out):
+    if not (out / "e3v2_raw.csv").exists():
+        return []
+    from qr.e3v2 import paired_vs
+    r = pd.read_csv(out / "e3v2_raw.csv")
+    n = json.loads((out / "e3v2_notes.json").read_text())
+    v = cfg["e3v2"]
+    rt = json.loads((out / "runtime.json").read_text()).get("e3v2", "n/a") if (out / "runtime.json").exists() else "n/a"
+    p = n["params"]
+    L = ["## E3 v2: MoE vs single head with fixes A-D (pre-registered)", "",
+         f"Code commit **{n['code_commit']}**, started {n['e3v2_started']}; grid `configs/e3v2.yaml` last committed "
+         f"{n['grid_commit']} (must predate the start). Runtime {rt} s; seeds {n['seeds_done']}"
+         + _prereg_warning(n)
+         + (" (**reduced to fit the time budget**)" if n["seeds_reduced"] else "") + ".", "",
+         f"Parameters: MoE {p['moe']:,}; single_head {p['single_head']:,}; single_head_matched {p['single_head_matched']:,} "
+         f"(head width {p['matched_width']}). All models: 24 phase-1 epochs on source chemistries (zero-shot model); "
+         "few-shot = phase 2 on the k adaptation cells with the **encoder frozen for every model** (single heads train "
+         "the head; MoE spawns an expert for the held-out chemistry from the shared expert or the nearest expert and "
+         "trains it + router + beta, existing experts frozen). Phase-1 config chosen on source-val, phase-2 epoch "
+         "(epoch 0 = no update included) on target-val; the blind test is scored once. All rows use **oracle EOL**. "
+         "Few-shot uses the phase-1 (source-train) scaler because the encoder is frozen (deviation, see document.md).", "",
+         md_table(summarise(r, ["fold", "regime", "model"])), ""]
+    c = pd.read_csv(out / "e3v2_configs.csv")
+    moe = c[c.model.str.startswith("moe_")]
+    if len(moe):
+        spec = moe.groupby(["model", "config"]).agg(beta=("beta", "mean"), max_expert_corr=("max_expert_corr", "mean"),
+                                                    gate_entropy_source=("gate_entropy_source", "mean"),
+                                                    val_mse=("val_mse", "mean"), times_selected=("selected", "sum")).round(3)
+        t = v["targets"]
+        spec["specialised"] = np.where((spec.max_expert_corr < t["max_expert_corr"]) & (spec.beta < t["beta"]), "yes", "no")
+        L += [f"Specialisation per MoE config (validation, mean over folds x seeds). Target: max_expert_corr < "
+              f"{t['max_expert_corr']} and beta < {t['beta']}:", "", md_table(spec.reset_index()), ""]
+    pv = pd.DataFrame(paired_vs(r, cfg))
+    if len(pv):
+        L += ["Paired comparisons (RMSE, cycles; diff = MoE - reference, negative = MoE better; pairs = fold x seed; "
+              f"bootstrap 95 % CI, {v['bootstrap']} draws). 'MoE better' only if the whole CI is below 0. "
+              f"{len(pv)} comparisons are reported, so expect about {len(pv) * 0.05:.1f} CIs to exclude 0 by chance.", "",
+              md_table(pv), ""]
+        for x in pv.itertuples():
+            L.append(f"- {x.comparison}, {x.regime}, folds {x.folds}: {x.wins}/{x.pairs} wins, "
+                     f"{x.mean_rmse_diff:+.1f} [{x.ci95_low:+.1f}, {x.ci95_high:+.1f}] -> **{x.verdict}**.")
+    return L + [""]
 
 
 def _e5_section(cfg, out, e2r):
@@ -655,7 +746,8 @@ def main(argv=None, cfg=None):
         if s not in steps:
             continue
         fn = {"e0": lambda: e0(cfg, data_dir, out), "e1": lambda: e1(cfg, out), "e2": lambda: e2(cfg, out),
-              "e3": lambda: e3(cfg, out), "e4": lambda: e4(cfg, data_dir, out), "e5": lambda: e5(cfg, out),
+              "e3": lambda: e3(cfg, out), "e3v2": lambda: e3v2(cfg, out), "e4": lambda: e4(cfg, data_dir, out),
+              "e5": lambda: e5(cfg, out),
               "report": lambda: report(cfg, out)}[s]
         _timed(out, s, fn)
 

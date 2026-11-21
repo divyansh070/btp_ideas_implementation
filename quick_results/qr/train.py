@@ -62,7 +62,7 @@ def fit_single(prep, sets, label, cfg, seed, aux_cells=None, aux_dyn=False):
         data[k] = (_t(x), _t(target(prep, idx, label, cfg["rul_scale"])), _aux(prep, idx, d, aux_cells, aux_dyn))
     d_aux = 0 if aux_cells is None else aux_cells.shape[1] + (prep["D"].shape[1] if aux_dyn else 0)
     model = SingleHead(prep["X"].shape[-1], "sigmoid" if label == "frac" else "softplus",
-                       d_aux=d_aux, aux_disp=aux_dyn).to(DEV)
+                       d_aux=d_aux, aux_disp=aux_dyn, width=cfg.get("width", 64)).to(DEV)
     model.aux_cells, model.aux_dyn = aux_cells, aux_dyn
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     best, best_state = math.inf, None
@@ -163,7 +163,14 @@ def fit_moe(prep, sets_cells, held, mode, cfg, seed):
     tr = _moe_tensors(prep, window_idx(prep, tr_c), sc, sets, chem_ids)
     va = _moe_tensors(prep, window_idx(prep, va_c), sc, sets, chem_ids)
     model = MoE(prep["X"].shape[-1], prep["text"].shape[1], prep["D"].shape[1] , len(sets), cfg["bias"]).to(DEV)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    if "beta_init" in cfg:  # E3 v2 fix A: start beta low so the experts carry the prediction
+        b = cfg["beta_init"]
+        model.beta_logit.data.fill_(math.log(b / (1 - b)))
+    mult = cfg.get("beta_lr_mult", 1)
+    params = model.parameters() if mult == 1 else [  # E3 v2: beta was lr-limited in runs 1-2
+        {"params": [p for n, p in model.named_parameters() if n != "beta_logit"]},
+        {"params": [model.beta_logit], "lr": cfg["lr"] * mult}]
+    opt = torch.optim.Adam(params, lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     w, n_a, n_b = cfg["losses"], cfg["epochs_a"], cfg["epochs_b"]
     hist, best, best_state, best_tau = [], math.inf, None, cfg["tau"][0]
     norms = torch.cat([tr["text"], va["text"]]).norm(dim=1)   # raw (pre-normalisation) embedding norms of this run

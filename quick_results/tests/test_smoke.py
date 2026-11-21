@@ -37,6 +37,11 @@ def smoke_cfg():
                      models=["lstm_frac", "lstm_rul"] + ([] if MAC else ["lgbm"]))
     cfg["e3"].update(regimes=["zero_shot", "few_1"], epochs_a=1, epochs_b=2, gate_plot_regime="zero_shot")
     cfg["e5"].update(seeds=[0, 1], regimes=["zero_shot", "few_1"], bootstrap=200)
+    v = cfg["e3v2"]
+    v.update(seeds=[0], folds=["LFP", "NMC", "NCA"], few_shot=["few_1"], bootstrap=200)
+    v["phase1"].update(epochs_total=3, single_head_grid=v["phase1"]["single_head_grid"][:2],
+                       moe_grid=[{"id": "m1", "epochs_a": 1, "spec": 0.05}, {"id": "m2", "epochs_a": 2, "spec": 0.2}])
+    v["phase2"].update(epochs=2)
     return cfg
 
 
@@ -73,8 +78,17 @@ def test_end_to_end(tmp_path):
     a = e5[(e5.variant == "A_none") & (e5.label == "frac") & (e5.seed == 0)].set_index(["fold", "regime"]).rmse
     b = e2[(e2.model == "lstm_frac") & (e2.seed == 0)].set_index(["fold", "regime"]).rmse
     assert np.allclose(a, b.loc[a.index])                               # A_none is exactly E2 lstm_frac (paired)
+    v2 = pd.read_csv(out / "e3v2_raw.csv")
+    assert set(v2[v2.regime == "zero_shot"].model) == {"single_head", "single_head_matched", "moe_mask", "moe_bias"}
+    assert set(v2[v2.regime == "few_1"].model) == {"single_head", "single_head_matched", "moe_mask_spawn_shared",
+                                                  "moe_mask_spawn_nearest", "moe_bias_spawn_shared", "moe_bias_spawn_nearest"}
+    assert v2.oracle_eol.all() and np.isfinite(v2.rmse).all() and v2.grid_commit.notna().all()
+    c = pd.read_csv(out / "e3v2_configs.csv")
+    assert c.groupby(["fold", "seed", "model"]).selected.sum().eq(1).all()      # exactly one config chosen per model
+    assert c[c.model.str.startswith("moe")][["beta", "max_expert_corr", "gate_entropy_source"]].notna().all().all()
     report = (out / "REPORT.md").read_text()
-    for s in ["## E0", "## E1", "## E2", "## E3", "## E4", "## E5", "Paired comparisons", "C_text vs D_shuffled",
+    for s in ["## E0", "## E1", "## E2", "## E3", "## E3 v2", "Specialisation per MoE config", "vs single_head_matched",
+              "## E4", "## E5", "Paired comparisons", "C_text vs D_shuffled",
               "oracle", "What this does NOT show"]:
         assert s in report, s
     assert (out / "e1_fraction_of_life.png").exists() and (out / "e3_gate_weights.png").exists()
@@ -402,3 +416,51 @@ def test_e5_aux_inputs_paired_stats_and_budget(tmp_path):
     cfg["e5"].update(seeds=[0, 1, 2], regimes=["zero_shot"], variants=["A_none"], budget_minutes=0)
     rows, notes = E5.run_e5(prep, cfg, log=lambda *_: None)
     assert notes["seeds_done"] == [0] and notes["seeds_reduced"] and notes["rul_dropped_from_seed"] == 1
+
+
+
+def test_e3v2_spawn_freeze_matched_and_budget(tmp_path):
+    import torch
+    from qr import e3v2 as V
+    from qr import train as T
+    from qr.features import make_split, prepare, regime_sets, window_idx
+    from qr.models import MoE
+    torch.manual_seed(0)
+    m = MoE(25, 16, 5, 2, 2.0).eval()
+    x, d, txt = torch.randn(3, 10, 25), torch.randn(3, 5), torch.randn(3, 16)
+    match = torch.ones(3, 2)
+    with torch.no_grad():
+        a = m(x, d, txt, match, 1.0, "bias")
+        m.add_expert(1)
+        b = m(x, d, txt, torch.ones(3, 3), 1.0, "bias")
+    assert m.E == 3 and torch.allclose(a["logits"], b["logits"][:, :2]) and torch.allclose(b["logits"][:, 2], b["logits"][:, 1])
+    assert torch.allclose(b["f"][:, 2], b["f"][:, 1])                     # "nearest" spawn starts as a copy
+    with torch.no_grad():
+        m.add_expert("shared")
+        c = m(x, d, txt, torch.ones(3, 4), 1.0, "bias")
+    assert torch.allclose(c["f"][:, 3], c["fs"])                           # "shared" spawn starts as the shared expert
+
+    qd.make_synthetic(tmp_path)
+    _, kept = qd.load_cells(tmp_path, ["SNL"])
+    prep = prepare(kept, qd.load_text_embeddings(tmp_path), cap=20)
+    w, moe_n, matched_n, single_n = V.matched_width(prep)
+    assert abs(matched_n - moe_n) / moe_n < 0.02 and single_n < moe_n
+    cfg = smoke_cfg()
+    sp = make_split(prep["chem"], "NCA", 0, cfg["split"])
+    best, rows = V.phase1(prep, sp, "NCA", 0, cfg, w)
+    fit = best["moe_bias"][0]
+    frozen = {n: p.detach().clone() for n, p in fit["model"].named_parameters()}
+    new, ep, src = V.adapt_moe(fit, prep, sp["adapt"][:1], sp["adapt"][:1], "NCA", "nearest", {"epochs": 3, "lr": 0.05},
+                               0, cfg["e3"])
+    after = dict(new["model"].named_parameters())
+    for n, p in frozen.items():                                          # encoder, old experts, shared: untouched
+        if n.startswith(("enc.", "shared.", "experts.0.", "experts.1.")):
+            assert torch.equal(after[n], p) and not after[n].requires_grad, n
+    assert isinstance(src, int) and len(new["sets"]) == 3 and fit["model"].E == 2   # phase-1 model not modified
+    (model, sc), _, _ = best["single_head"]
+    enc0 = {n: p.detach().clone() for n, p in model.enc.named_parameters()}
+    m2, _ = V.adapt_single(model, sc, prep, sp["adapt"][:1], sp["adapt"][:1], {"epochs": 3, "lr": 0.05}, 0, 256)
+    assert all(torch.equal(p, enc0[n]) for n, p in m2.enc.named_parameters())
+    cfg["e3v2"].update(seeds=[0, 1], folds=["NCA"], budget_minutes=0)
+    _, _, notes = V.run_e3v2(prep, cfg, log=lambda *_: None)
+    assert notes["seeds_done"] == [0] and notes["seeds_reduced"]

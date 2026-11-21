@@ -33,6 +33,14 @@ Routing: PBT-style hard mask vs our additive category bias, τ 2.0 → 0.5. Stag
 L_bal, L_route (annealed to 0 by 40 %), L_spec, each switchable in `configs/quick.yaml`. Logs gate weights per chemistry, β, entropy,
 expert correlation; reports the folds where the held-out chemistry has no matching expert (LFP, NCA). The Neural ODE is omitted.
 
+**E3 v2, MoE vs single head with fixes A-D** (`--steps e3v2`, protocol pre-registered in `configs/e3v2.yaml`).
+Phase 1 on source chemistries (also the zero-shot model): single_head, single_head_matched (head width matched to the
+MoE's parameter count), moe_mask / moe_bias with fix A (Stage A length / L_spec grid, beta starts at 0.2 with 10x lr),
+24 epochs each, config chosen on source-val. Few-shot (2 / 5 cells): encoder frozen for every model; single heads tune
+the head, the MoE spawns an expert for the held-out chemistry from the shared expert or the nearest expert and tunes it
++ router + beta; epoch chosen on target-val (epoch 0 = no update included). Seeds 0-4, paired bootstrap CIs vs both
+single heads, LFP + NCA reported separately, specialisation table (target corr < 0.8, beta < 0.4).
+
 **E4 (optional, `RUN_E4`), released PBT on our LOCO protocol.** Loads the Zenodo checkpoint (17972780) with PBT's
 own code (`third_party/PBT` if present, else a clone pinned to 74f03a7) and PBT's cached prompt embeddings. No Llama
 download or token is needed: PBT's tokenizer is never used and is stubbed. E4a: zero-shot, PBT's own input (first
