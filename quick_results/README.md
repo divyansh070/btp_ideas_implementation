@@ -15,7 +15,7 @@ Life labels follow PBT's rule (`process_scripts/extract_life_labels.py`, ported)
 The pickles come from Zenodo and are loaded with `pickle` (as PBT does); only load them inside Colab.
 
 **E0, pipeline and validation gate.** PBT filters (< 100 cycles, last-cycle SOH ≥ 82.5 %, life ≤ 100), 30-cycle windows with 10
-cycles sampled (stride 1, at most 150 per cell for runtime), 17 stats + 11 deltas per cycle (`Qd_min` dropped: ~0 every cycle by construction), RUL and fraction-of-life labels,
+cycles sampled (stride 1, at most 150 per cell for runtime), 17 stats + 8 deltas = 25 features per cycle (`Qd_min` dropped: ~0 every cycle by construction; deltas of `V_max`, `V_min`, `I_C_max` dropped: protocol-fixed, ~0 inside a window), RUL and fraction-of-life labels,
 cell-level leave-one-chemistry-out splits (held-out chemistry 60 / 10 / 30), scaler fit on source-train + target-adaptation and clipped
 to [-0.5, 1.5]. Gate checks: counts vs PBT's split, zero EOL fallbacks, agreement with PBT labels, per-cell corr(RUL, capacity) > 0.5,
 SNL three-way tagging, scaled target features (1st-99th percentile) in [-0.2, 1.2], feature std > 0.01. Training refuses to start if a check

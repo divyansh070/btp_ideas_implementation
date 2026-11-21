@@ -216,7 +216,7 @@ DIAGRAM = """```
         |                                                         |
   any 30 consecutive cycles, 10 sampled                 frozen Llama-3.1-8B last token
         |                                               (PBT's cached 4096-d vector)
-  per cycle: 17 stats + 11 deltas = 28 features                   |
+  per cycle: 17 stats + 8 deltas = 25 features                    |
         |                                               linear + LeakyReLU -> 64
   scaler (fit: source train + target adaptation, clip [-0.5,1.5]) |
         |                                    6 dynamics (dQ slope/spread/curvature,
@@ -247,7 +247,9 @@ def report(cfg, out):
           f"- Runtime (s): {rt}; host: {platform.node()} / torch device {T.DEV}.", ""]
     if (out / "e0_dropped_cells.csv").exists():
         dr = pd.read_csv(out / "e0_dropped_cells.csv")
-        L += [f"Dropped cells ({len(dr)}; missing prompt embeddings: policy `{cfg['data']['text_embedding_missing']}`):", "",
+        by = "; ".join(f"{n} {r}" for r, n in dr.reason.value_counts().items()) if len(dr) else "none"
+        L += [f"Dropped cells: {len(dr)} ({by}). Missing prompt embeddings policy: "
+              f"`{cfg['data']['text_embedding_missing']}`.", "",
               md_table(dr) if len(dr) else "none", ""]
     rows = []
     for held in cfg["folds"]:
@@ -312,11 +314,12 @@ def report(cfg, out):
 
     L += ["## How Version 1 works end to end", "", DIAGRAM, ""]
     L += ["## What this shows", "",
-          "- The shared pipeline runs end to end on real SNL / CALCE / HNEI cells with the PBT life-label rule, "
-          "and every gate check is reported with numbers (E0).",
-          "- Whether a leave-one-chemistry-out gap exists for single-head models, measured as zero-shot vs few-shot vs "
-          "target-only on the same blind-test cells (E2, see the gap lines above).",
-          "- How the hard mask and the additive bias route an unseen chemistry, with gate weights logged (E3).", "",
+          f"- The shared pipeline runs end to end on real {' / '.join(cfg['data']['datasets'])} cells with the PBT life-label "
+          "rule; every gate check is reported with its number (E0 gate table).",
+          "- Whether single-head models show a leave-one-chemistry-out gap: in the E2 table, compare the `zero_shot`, "
+          "`few_2` / `few_5` and `target_only` rows of each fold (same blind-test cells), and the E2 'Gap' summary for `lstm_frac`.",
+          "- How the hard mask and the additive bias route an unseen chemistry: E3 results table (MoE vs `single_head` per fold "
+          "and regime, with `held_out_has_matching_expert`), the E3 diagnostics table and the mean-gate-weight-per-chemistry table.", "",
           "## What this does NOT show", "",
           f"- Anything statistically solid: tiny N (held-out test sets of 3-6 cells, {len(cfg['seeds'])} seeds). Preliminary only.",
           "- Real-world RUL accuracy for fraction-of-life models: every `oracle_eol=True` number uses the TRUE EOL to "

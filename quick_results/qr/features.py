@@ -1,10 +1,11 @@
 """Windows, features, labels, cell-level LOCO splits, scaler.
 
 Window (guide §4): 30 consecutive cycles, 10 sampled evenly, stride 1 (capped per cell, see max_windows_per_cell).
-Per sampled cycle: 17 stats (mean/std/min/max/var/median of V, I in C-rate, Qd, minus Qd_min) + 11 window-relative
-deltas (mean/std/min/max of each signal minus the window's first sampled cycle, minus d_Qd_min) = 28 features.
-Qd_min is dropped (decision 2026-11-21): Coulomb counting restarts every cycle, so it is ~0 by construction.
-The guide's "10 cycles x 30 features" (§6.1) therefore becomes 10 x 28. Labels: RUL = EOL - last sampled cycle; fraction of life = RUL / EOL.
+Per sampled cycle: 17 stats (mean/std/min/max/var/median of V, I in C-rate, Qd, minus Qd_min) + 8 window-relative
+deltas (mean/std/min/max of each signal minus the window's first sampled cycle, minus d_Qd_min, d_V_max, d_V_min,
+d_I_C_max) = 25 features. Decisions (document.md): Qd_min ~0 by construction (Coulomb counting restarts every cycle);
+d_V_max, d_V_min, d_I_C_max ~0 by construction (protocol-fixed cutoff voltages and max C-rate; the base stats stay).
+The guide's "10 cycles x 30 features" (§6.1) therefore becomes 10 x 25. Labels: RUL = EOL - last sampled cycle; fraction of life = RUL / EOL.
 Dynamics (router, §6.4): 5 here + latent displacement computed inside the model = 6.
 """
 import zlib
@@ -12,11 +13,12 @@ import zlib
 import numpy as np
 
 ALL_STATS = [f"{g}_{st}" for g in ("V", "I_C", "Qd") for st in ("mean", "std", "min", "max", "var", "median")]
-DROPPED = {"Qd_min"}                                            # constant by construction (see module docstring)
+DROPPED = {"Qd_min"}                                            # stats constant by construction (see module docstring)
+DROPPED_DELTAS = {"Qd_min", "V_max", "V_min", "I_C_max"}        # deltas constant by construction (protocol-fixed)
 STAT_COLS = [i for i, n in enumerate(ALL_STATS) if n not in DROPPED]
-DELTA_COLS = [s * 6 + j for s in range(3) for j in range(4) if ALL_STATS[s * 6 + j] not in DROPPED]
+DELTA_COLS = [s * 6 + j for s in range(3) for j in range(4) if ALL_STATS[s * 6 + j] not in DROPPED_DELTAS]
 FEAT_NAMES = [ALL_STATS[c] for c in STAT_COLS] + ["d_" + ALL_STATS[c] for c in DELTA_COLS]
-N_FEAT = len(FEAT_NAMES)  # 28
+N_FEAT = len(FEAT_NAMES)  # 25
 DYN_NAMES = ("dQ_slope", "dQ_spread", "dQ_curvature", "dV_mean", "Q_ratio")
 
 

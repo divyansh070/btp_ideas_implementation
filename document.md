@@ -10,6 +10,7 @@
 - 2026-11-21 — Approved: E3 expert sets are 'LFP vs rest' of the fold's source, and 'NMC vs rest' when LFP is held out.
 - 2026-11-21 — Notebook default USE_HUST=True (+77 LFP cells, 1.39 GB).
 - 2026-11-21 — quick_results: cells without a PBT prompt embedding are dropped (config `data.text_embedding_missing: drop|error`, default drop), never zero-filled. They are listed in e0_dropped_cells.csv, REPORT setup and the gate table.
+- 2026-11-21 — **Deviation from guide §4:** deltas `d_V_max`, `d_V_min`, `d_I_C_max` dropped (base `V_max`, `V_min`, `I_C_max` kept). They are protocol-fixed (cutoff voltages, max C-rate), so their within-window deltas are ~0 by construction. Colab E0 gate failed only on "min feature std > 0.01" in all 4 folds (0.0042–0.0056), caused by exactly these three. Per-cycle features = 17 stats + 8 deltas = 25.
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -164,3 +165,11 @@
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 4 passed, 1 skipped (LightGBM, macOS), 5.8 s. Loopback log: cut at 150,000 → "resuming at 147456 of 300000" → "OK (300000 bytes, md5 verified)"; rerun "present ... size verified, skipping"; bad md5 → RuntimeError after 2 attempts, no file renamed. `remote_meta()` against the live APIs (metadata only) returns size + md5 for SNL, CALCE, HNEI, HUST, Life labels, prompt embeddings and PBT_checkpoints.
 - Assumptions / risks: assumes Zenodo honours Range on /files/<name>/content. If it ignores Range, the code restarts the file rather than corrupting it. Not yet exercised against Zenodo itself (no data downloads on this Mac).
 - Commit: "quick_results: resumable checksum-verified downloads (document.md)"
+
+### 2026-11-21 18:05 — quick_results: drop 3 protocol-fixed deltas (25 features); REPORT dropped-cell header and "What this shows"
+- Error (Colab E0): gate "min feature std > 0.01" FAILED in all 4 folds (min std 0.0042–0.0056) on d_I_C_max, d_V_max, d_V_min. Every other gate check passed.
+- Changed: quick_results/qr/features.py (DROPPED_DELTAS = {Qd_min, V_max, V_min, I_C_max}; N_FEAT 25), run_all.py (Dropped-cells header grouped by reason; "What this shows" points at the E0 gate table, the E2 table rows per fold/regime + Gap summary, and the E3 results / diagnostics / gate-weight tables; dataset list from config; diagram 25), README.md.
+- Why: user decision (Decisions, this date). REPORT header said "11; missing prompt embeddings" although 9 were dropped by the life-label rule (last-cycle SOH ≥ 0.825) and 2 for missing embeddings.
+- Verified by: `.venv/bin/python -c "from qr.features import N_FEAT, FEAT_NAMES"` → 25, deltas [d_V_mean, d_V_std, d_I_C_mean, d_I_C_std, d_I_C_min, d_Qd_mean, d_Qd_std, d_Qd_max]. Smoke `.venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 4 passed, 1 skipped (LightGBM, macOS), 5.8 s. Synthetic e0+report with one embedding removed renders "Dropped cells: 1 (1 no_prompt_embedding)".
+- Assumptions / risks: Colab cached outputs must be cleared for E0 to rerun with 25 features (delete OUT/e0_gate.csv and OUT/prepared.pkl; E1–E3 CSVs too if they exist).
+- Commit: "quick_results: drop protocol-fixed deltas, report header by reason (document.md)"
