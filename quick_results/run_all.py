@@ -17,7 +17,7 @@ import yaml
 
 from qr import data as qd
 from qr import plots
-from qr.features import make_split, prepare, regime_sets, window_idx
+from qr.features import feature_constancy, make_split, prepare, regime_sets, window_idx
 from qr.gate import run_gate
 from qr.metrics import chem_metrics, md_table, summarise
 from qr import train as T
@@ -69,6 +69,7 @@ def e0(cfg, data_dir, out):
                        label_source=c["label_source"], drop=c["drop"]) for c in cells]).to_csv(out / "e0_cell_list.csv", index=False)
     with open(out / "prepared.pkl", "wb") as f:
         pickle.dump(prep, f)
+    pd.DataFrame(feature_constancy(prep)).to_csv(out / "e0_feature_constancy.csv", index=False)
     pd.DataFrame(gate).to_csv(out / "e0_gate.csv", index=False)
     print(pd.DataFrame(gate)[["check", "value", "passed"]].to_string())
 
@@ -203,7 +204,7 @@ DIAGRAM = """```
         |                                                         |
   any 30 consecutive cycles, 10 sampled                 frozen Llama-3.1-8B last token
         |                                               (PBT's cached 4096-d vector)
-  per cycle: 18 stats + 12 deltas = 30 features                   |
+  per cycle: 17 stats + 11 deltas = 28 features                   |
         |                                               linear + LeakyReLU -> 64
   scaler (fit: source train + target adaptation, clip [-0.5,1.5]) |
         |                                    6 dynamics (dQ slope/spread/curvature,
@@ -243,6 +244,11 @@ def report(cfg, out):
     g["passed"] = g.passed.map({True: "PASS", False: "**FAIL**"})
     L += [md_table(g), "", f"Gate: **{'PASS' if (g.passed == 'PASS').all() else 'FAIL'}**"
           + ("" if (g.passed == "PASS").all() or not cfg["gate"]["allow_fail"] else " (training ran anyway: gate.allow_fail=true)"), ""]
+
+    if (out / "e0_feature_constancy.csv").exists():
+        fc = pd.read_csv(out / "e0_feature_constancy.csv").round(4)
+        L += ["Feature constancy (raw, unscaled; `frac_cells_constant` = share of cells where the feature does not move "
+              "inside the cell). Informational, not a gate check:", "", md_table(fc), ""]
 
     if (out / "e1_life.csv").exists():
         L += ["## E1: why fraction of life", "", "![E1](e1_fraction_of_life.png)", "",

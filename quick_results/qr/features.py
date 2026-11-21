@@ -1,19 +1,22 @@
 """Windows, features, labels, cell-level LOCO splits, scaler.
 
 Window (guide §4): 30 consecutive cycles, 10 sampled evenly, stride 1 (capped per cell, see max_windows_per_cell).
-Per sampled cycle: 18 stats (mean/std/min/max/var/median of V, I in C-rate, Qd) + 12 window-relative deltas
-(mean/std/min/max of each signal minus the window's first sampled cycle) = 30 features, matching the guide's
-"10 cycles x 30 features" (§6.1). Labels: RUL = EOL - last sampled cycle; fraction of life = RUL / EOL.
+Per sampled cycle: 17 stats (mean/std/min/max/var/median of V, I in C-rate, Qd, minus Qd_min) + 11 window-relative
+deltas (mean/std/min/max of each signal minus the window's first sampled cycle, minus d_Qd_min) = 28 features.
+Qd_min is dropped (decision 2026-11-21): Coulomb counting restarts every cycle, so it is ~0 by construction.
+The guide's "10 cycles x 30 features" (§6.1) therefore becomes 10 x 28. Labels: RUL = EOL - last sampled cycle; fraction of life = RUL / EOL.
 Dynamics (router, §6.4): 5 here + latent displacement computed inside the model = 6.
 """
 import zlib
 
 import numpy as np
 
-DELTA_COLS = [s * 6 + j for s in range(3) for j in range(4)]  # mean,std,min,max of each signal
-N_FEAT = 18 + len(DELTA_COLS)
-FEAT_NAMES = [f"{g}_{st}" for g in ("V", "I_C", "Qd") for st in ("mean", "std", "min", "max", "var", "median")]
-FEAT_NAMES += ["d_" + FEAT_NAMES[c] for c in DELTA_COLS]
+ALL_STATS = [f"{g}_{st}" for g in ("V", "I_C", "Qd") for st in ("mean", "std", "min", "max", "var", "median")]
+DROPPED = {"Qd_min"}                                            # constant by construction (see module docstring)
+STAT_COLS = [i for i, n in enumerate(ALL_STATS) if n not in DROPPED]
+DELTA_COLS = [s * 6 + j for s in range(3) for j in range(4) if ALL_STATS[s * 6 + j] not in DROPPED]
+FEAT_NAMES = [ALL_STATS[c] for c in STAT_COLS] + ["d_" + ALL_STATS[c] for c in DELTA_COLS]
+N_FEAT = len(FEAT_NAMES)  # 28
 DYN_NAMES = ("dQ_slope", "dQ_spread", "dQ_curvature", "dV_mean", "Q_ratio")
 
 
@@ -26,13 +29,13 @@ def cell_windows(cell, W=30, K=10, cap=None):
         starts = starts[np.round(np.linspace(0, len(starts) - 1, cap)).astype(int)]
     off = np.round(np.linspace(0, W - 1, K)).astype(int)
     idx = starts[:, None] + off
-    s = cell["stats"][idx]                                         # [N, K, 18]
-    x = np.concatenate([s, s[:, :, DELTA_COLS] - s[:, :1, DELTA_COLS]], axis=2)
+    s = cell["stats"][idx]                                         # [N, K, 18] raw stats
+    x = np.concatenate([s[:, :, STAT_COLS], s[:, :, DELTA_COLS] - s[:, :1, DELTA_COLS]], axis=2)
     q = cell["qmax"][idx] / cell["qmax"][idx][:, :1]                # capacity relative to window start
     t = off / (W - 1)
     lin = np.polyfit(t, q.T, 1)
     quad = np.polyfit(t, q.T, 2)
-    dyn = np.stack([lin[0], q.std(1), quad[0], s[:, -1, 0] - s[:, 0, 0], q[:, -1]], 1)
+    dyn = np.stack([lin[0], q.std(1), quad[0], s[:, -1, 0] - s[:, 0, 0], q[:, -1]], 1)  # s[..., 0] = V_mean
     end_cycle = idx[:, -1] + 1
     rul = (cell["eol"] - end_cycle).astype(np.float32)
     ok = np.isfinite(x).all((1, 2)) & np.isfinite(dyn).all(1)
@@ -117,3 +120,18 @@ class Scaler:
         if clip:
             x, d = np.clip(x, -0.5, 1.5), np.clip(d, -0.5, 1.5)
         return x.astype(np.float32), d.astype(np.float32)
+
+
+def feature_constancy(prep, rel_tol=1e-3):
+    """Diagnostic for trivially constant features: global spread vs spread inside one cell (raw, unscaled)."""
+    x = prep["X"].reshape(-1, prep["X"].shape[-1])
+    cell = np.repeat(prep["cell_idx"], prep["X"].shape[1])
+    gstd, gabs = x.std(0), np.abs(x).mean(0) + 1e-12
+    rows = []
+    for j, name in enumerate(FEAT_NAMES):
+        within = np.array([x[cell == c, j].std() for c in np.unique(cell)])
+        rows.append(dict(feature=name, raw_mean=float(x[:, j].mean()), raw_global_std=float(gstd[j]),
+                         median_within_cell_std=float(np.median(within)),
+                         frac_cells_constant=float((within <= rel_tol * gabs[j]).mean()),
+                         globally_constant=bool(gstd[j] <= rel_tol * gabs[j])))
+    return rows

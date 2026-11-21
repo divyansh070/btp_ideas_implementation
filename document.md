@@ -4,6 +4,11 @@
 - 2026-11-20 — Log entries cannot contain their own hash; "Commit:" gives the exact commit subject (`git log --grep '<subject>'` finds it).
 - 2026-11-20 — Slide deck read from `~/Downloads/PBT_to_Our_Model.pptx` (no .pptx in docs/); not copied into the repo pending user confirmation.
 - 2026-11-21 — Change of plan (user): build a self-contained Colab proof of concept in quick_results/ (code only on this Mac; data + runs on Colab T4). src/ and docs/PLAN_track_A.md untouched.
+- 2026-11-21 — **Deviation from guide §4:** `Qd_min` (and its delta `d_Qd_min`) dropped from the per-cycle features. Coulomb counting restarts every cycle, so it is ~0 by construction and carries no information. Per-cycle features = 17 stats + 11 deltas = 28 (guide: 18 stats, "10 x 30" window). quick_results only; ALLOW_GATE_FAIL stays False by default.
+- 2026-11-21 — Approved: the window-relative deltas are mean/std/min/max of each signal minus the window's first sampled cycle.
+- 2026-11-21 — Approved: the gate's feature-range check uses the 1st–99th percentile of each scaled target (val+test) feature, not strict min/max. Zero-shot uses a source-only scaler because no target cells exist.
+- 2026-11-21 — Approved: E3 expert sets are 'LFP vs rest' of the fold's source, and 'NMC vs rest' when LFP is held out.
+- 2026-11-21 — Notebook default USE_HUST=True (+77 LFP cells, 1.39 GB).
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -20,10 +25,8 @@
 - A2 acceptance band for HNEI (0.033 ± 0.010, 3 seeds, MAPE@20 cycles) is a proposal (docs/PLAN_track_A.md); needs user OK. D4 "measurable gap" definition also proposed there.
 - PBT's per-dataset numbers in the main Fig. 4 are bars only (not readable as text); A2 targets come from Supp. Table 2 (first 20 cycles), not Fig. 4.
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
-- quick_results: per-cycle features = 18 stats + 12 deltas (mean/std/min/max per signal vs window start) = 30, to match the guide's "10 cycles x 30 features" (§6.1); the guide does not define which deltas. Interpretation, needs OK.
-- quick_results gate: range check uses the 1st-99th percentile of each scaled target (val+test) feature, not strict min/max; zero-shot uses a source-only scaler (no target cells exist). Interpretations, need OK.
-- quick_results gate will likely FAIL the std > 0.01 check on real data: Qd_min is ~0 every cycle (Coulomb counting restarts), so it is constant. Seen on synthetic cells. Options: drop it from the 18 features, or ALLOW_GATE_FAIL. Needs user decision (would change the guide's feature list).
-- quick_results E3: NMC-LCO (HNEI) stays a source cell and its components {NMC, LCO} give a partial cathode match to held-out NMC and LCO, so only the LFP and NCA folds have no matching expert. When LFP is held out, 'LFP vs rest' is replaced by 'NMC vs rest'. Neural ODE omitted.
+- quick_results E3: HNEI (NMC-LCO) is always a source cell; its components {NMC, LCO} give held-out NMC and LCO a partial cathode match, so only the LFP and NCA folds have no matching expert. Neural ODE omitted.
+- quick_results: other possibly-constant features, NOT dropped, awaiting user decision. `Qd_median` is constant by construction if Qd is 0 during charge and charge takes ≥ 50 % of a cycle's samples (likely, unverified on real data). Inside one cell, protocol-fixed features (`V_max`, `I_C_min`, `I_C_max`, `I_C_median`) and their deltas barely move; they vary across cells, so the std gate does not catch them. E0 now writes `e0_feature_constancy.csv` to settle this on real data.
 
 ## Log
 
@@ -138,3 +141,10 @@
 - Verified by: notebook JSON loads (22 cells); `run_all.py --steps ""` (download-only path, no download) exits 0. Notebook not executed (Colab only).
 - Assumptions / risks: E4 needs Colab secret HF_TOKEN with approved Llama-3.1 access. Default ALLOW_GATE_FAIL=False stops before E2 if the std gate fails (likely, Qd_min).
 - Commit: "quick_results: Colab notebook and README (document.md)"
+
+### 2026-11-21 16:52 — quick_results: drop Qd_min (28 features), constancy diagnostic, USE_HUST default on
+- Changed: quick_results/qr/features.py (ALL_STATS/DROPPED/STAT_COLS; DELTA_COLS without Qd_min; FEAT_NAMES 28; new feature_constancy()), quick_results/run_all.py (E0 writes e0_feature_constancy.csv, shown in REPORT; diagram 28), quick_results/README.md, quick_results/quick_results_colab.ipynb (USE_HUST=True); document.md Decisions (Qd_min deviation, 3 approved interpretations, HUST default) and Known issues (moved items removed, possible constants added)
+- Why: user decisions 1-3. Model input sizes come from prep["X"].shape[-1] (qr/train.py fit_single/fit_moe; LightGBM X[:, -1]), so features.py is the only place the dimension is defined.
+- Verified by: `.venv/bin/python -c "from qr.features import N_FEAT; print(N_FEAT)"` → 28. `.venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 2 passed, 1 skipped (LightGBM, macOS), 4.6 s. Constancy table on synthetic cells flags Qd_median, I_C_mean, I_C_median, V_max, d_I_C_mean: mostly artefacts of the symmetric synthetic cycles; real data decides.
+- Assumptions / risks: the HUST default roughly doubles the window count. The < 1 h T4 estimate is unverified.
+- Commit: "quick_results: drop Qd_min, feature constancy table, HUST default (document.md)"

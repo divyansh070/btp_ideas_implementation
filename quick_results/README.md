@@ -9,13 +9,13 @@ Same thing from a shell: `python run_all.py --data DATA_DIR --out OUT_DIR --down
 Each step skips itself if its CSV already exists in `OUT_DIR`; delete the CSV to rerun one step. `OUT_DIR/REPORT.md` is the result.
 
 **Data** (`qr/data.py`, fetched only inside Colab): BatteryLife v9 per-dataset zips from Zenodo 17958489 (SNL, CALCE, HNEI ≈ 0.25 GB;
-HUST 1.39 GB with `USE_HUST`), PBT's life labels (figshare 31148413), PBT's Llama prompt embeddings (Zenodo 17972780, 6 MB).
+plus HUST 1.39 GB, on by default in the notebook via `USE_HUST`), PBT's life labels (figshare 31148413), PBT's Llama prompt embeddings (Zenodo 17972780, 6 MB).
 SNL is split into LFP / NMC / NCA by cell name; CALCE = LCO, HNEI = NMC-LCO (always a source, never held out).
 Life labels follow PBT's rule (`process_scripts/extract_life_labels.py`, ported) and are cross-checked against PBT's JSONs.
 The pickles come from Zenodo and are loaded with `pickle` (as PBT does); only load them inside Colab.
 
 **E0, pipeline and validation gate.** PBT filters (< 100 cycles, last-cycle SOH ≥ 82.5 %, life ≤ 100), 30-cycle windows with 10
-cycles sampled (stride 1, at most 150 per cell for runtime), 18 stats + 12 deltas per cycle, RUL and fraction-of-life labels,
+cycles sampled (stride 1, at most 150 per cell for runtime), 17 stats + 11 deltas per cycle (`Qd_min` dropped: ~0 every cycle by construction), RUL and fraction-of-life labels,
 cell-level leave-one-chemistry-out splits (held-out chemistry 60 / 10 / 30), scaler fit on source-train + target-adaptation and clipped
 to [-0.5, 1.5]. Gate checks: counts vs PBT's split, zero EOL fallbacks, agreement with PBT labels, per-cell corr(RUL, capacity) > 0.5,
 SNL three-way tagging, scaled target features (1st-99th percentile) in [-0.2, 1.2], feature std > 0.01. Training refuses to start if a check
