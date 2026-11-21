@@ -93,3 +93,10 @@
 - Failed attempt: web-fetch of arxiv.org/html/2512.16334v4 → 404; the fetch tool could not parse the PDF bytes. Fix: extracted the saved PDF locally with PyMuPDF (`python3 -I`).
 - Assumptions / risks: the v4 numbers may differ in v5–v7 / the EES journal version (latest arXiv v7, 30 Sep 2026). A2 band, D1–D4 are proposals awaiting the user.
 - Commit: "docs: Track A plan with A2 target (docs/PLAN_track_A.md)"
+
+### 2026-11-21 16:25 — Scaffold src/ and configs/
+- Changed: src/__init__.py, src/data/__init__.py, src/models/__init__.py, src/eval/__init__.py (all empty), configs/.gitkeep
+- Why: brief step 5; layout in CLAUDE.md. src/__init__.py added so `python -m src.data.gate` (PLAN P8) resolves.
+- Verified by: `.venv/bin/python -c "import src.data, src.models, src.eval"` → import OK. `git status` shows no data/weights/.venv/third_party staged.
+- Assumptions / risks: no model or training code (per brief).
+- Commit: "scaffold: src/{data,models,eval} packages and configs/"
