@@ -1,0 +1,33 @@
+# E3 v2: PRE-REGISTERED. Committed before any Colab run of E3 v2; do not edit after results are seen.
+# Selection uses validation cells only: phase-1 config on source-val, few-shot epoch on target-val.
+# The blind test is scored once per (fold, seed, regime, model). Same paired splits as E2/E3 (make_split).
+seeds: [0, 1, 2, 3, 4]
+folds: [LFP, NMC, NCA, LCO]
+few_shot: [few_2, few_5]
+focus_folds: [LFP, NCA]            # folds where the held-out chemistry has no matching expert
+bootstrap: 10000
+budget_minutes: 90                 # L4. If the next seed would exceed it, stop adding seeds (report says so)
+
+phase1:                            # trained on source chemistries only; zero_shot = this model
+  epochs_total: 24                 # every model gets the same number of epochs (C)
+  single_head_grid:                # single_head and single_head_matched (matched = width tuned to MoE params)
+    - {id: s1, lr: 0.001}
+    - {id: s2, lr: 0.0003}
+  moe_grid:                        # fix A: longer Stage A and/or stronger L_spec; epochs_b = 24 - epochs_a
+    - {id: m1, epochs_a: 8, spec: 0.05}
+    - {id: m2, epochs_a: 8, spec: 0.2}
+    - {id: m3, epochs_a: 12, spec: 0.05}
+    - {id: m4, epochs_a: 12, spec: 0.2}
+  moe_fixed: {beta_init: 0.2, beta_lr_mult: 10}   # fix A: beta starts low and is no longer lr-limited
+
+phase2:                            # few-shot adaptation on the k adaptation cells; encoder frozen for EVERY model
+  epochs: 20                       # epoch 0 (no update) is a selection candidate
+  lr: 0.001
+  spawn_init: [shared, nearest]    # MoE: new expert for the held-out chemistry, copied from the shared expert or
+                                   # from the expert with the highest mean (unmasked) router weight on the k cells
+  # trainable: single heads -> head; MoE -> new expert + router (incl. text projection) + beta.
+  # frozen: encoder (all models), existing experts and the shared expert (MoE).
+
+scaler: source_only                # few-shot keeps the phase-1 (source-train) scaler because the encoder is frozen.
+                                   # DEVIATION from CLAUDE.md "fit on source-train + target-adaptation": needs user OK.
+targets: {max_expert_corr: 0.8, beta: 0.4}   # specialisation happened if corr < 0.8 and beta < 0.4

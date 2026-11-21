@@ -15,6 +15,7 @@
 - 2026-11-21 — E4 runs without Llama: PBT's tokenizer (models/PBT.py:487-498) is created and given padding_side but never used; BatteryLifeConfig(text_config=None) defaults to LlamaConfig() with no download (configuration_BatteryLifeLLM.py:112-113). The tokenizer is stubbed and PBT's cached prompt embeddings are used. HF_TOKEN is only checked (informational notebook cell).
 - 2026-11-21 — E4b uses our reimplementation of PBT's FT recipe, not finetune_model.py (it hard-wires PBT's split lists via dataset names, calls wandb.init and rewrites args from args.json).
 - 2026-11-21 — E4b: FT lr 1e-5 (PBT's lower bound) and AT (PBT adapters, width 16, lr 2.5e-5 = finetune_PBT.sh default); epoch -1 (no update) is a selection candidate; the Track A gate uses PBT_selected (zero-shot / FT / AT chosen on target val) vs the non-oracle target_only lstm_rul, and is marked not testable when > 50 % of a fold's test cells were in PBT's train/val split.
+- 2026-11-21 — E3 v2 protocol pre-registered in quick_results/configs/e3v2.yaml (A–D + user additions 1–5): grid ≤ 4 settings per model, selection on source-val (phase-1 config) and target-val (few-shot epoch, epoch 0 included), blind test scored once, seeds 0–4, paired bootstrap vs single_head and single_head_matched, "MoE better" only if the CI is below 0.
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -36,6 +37,7 @@
 - quick_results E3 run 2 pending: does unit-length text normalisation remove the near one-hot source gates (run 1 entropy ~0.01)? Check gate_entropy_source / logit_gap_over_tau_source and text_norm_raw_* in e3_history.csv. **First run-2 attempt was not a run:** E3 was skipped as cached (every E3 digit identical to run 1, runtime e3=1684.3 copied). Rerun with the notebook's E3 cell, which now uses `--force e3`.
 - quick_results E4 ran on Colab at commit 5c9ad0c: E4b FT (lr 1e-4, no epoch-0 candidate) was worse than zero-shot on every fold except LCO (e.g. LFP 223 → 547 RMSE). Fixed in the entry below; E4 must be rerun (--force e4) for valid FT/AT/selected numbers. The run-5c9ad0c REPORT's gate lines are invalid.
 - quick_results E5: not yet run on Colab; T4 runtime estimate ≈ 280 fits × ~5 s ≈ 25 min (from E2 run 1: 512 s for 96 torch fits + LightGBM), unverified. outputs_run2/ (E3 run 2) not yet committed: waiting for the user's download.
+- **E3 v2 scaler deviation (needs user OK before the Colab run):** with the encoder frozen in few-shot, the input scaler must stay the phase-1 one (fit on source-train only). CLAUDE.md requires the fit on source-train + target-adaptation. Complying means retraining phase 1 per regime (≈ 3× phase-1 cost, ≈ 170 min on a T4, beyond the 90-min budget). configs/e3v2.yaml has `scaler: source_only`; clipping to [-0.5, 1.5] still applies.
 
 ## Log
 
@@ -245,3 +247,9 @@
 - Why: preserve run 2 (E3 at commit 7c7387b, started 2026-11-21T15:58:50Z, e3 runtime 1548 s). It is a real rerun: MoE numbers differ from run 1; source gate entropy (bias) 0.21–0.39 vs ~0.01 in run 1; raw text-embedding norm ≈ 148 (confirms the unscaled-embedding hypothesis); accuracy essentially unchanged (moe_bias beats single head in 5/12 cells, moe_mask 6/12, mostly within 1 std).
 - Verified by: `grep "code commit" outputs_run2/REPORT.md` → 7c7387b in the setup and the E3 section.
 - Commit: "results: E3 run 2 report (outputs_run2/REPORT.md)"
+
+### 2026-11-21 23:09 — E3 v2 pre-registered grid (configs/e3v2.yaml)
+- Changed: quick_results/configs/e3v2.yaml (new), document.md Decisions + Known issues (scaler deviation).
+- Why: user's E3 v2 brief item 4: write the hyperparameter grid and commit it BEFORE any Colab run. Content: seeds 0–4; folds LFP/NMC/NCA/LCO; few_2/few_5; 24 phase-1 epochs for every model; single_head and single_head_matched grid lr ∈ {1e-3, 3e-4}; MoE grid (epochs_a, L_spec) ∈ {8, 12} × {0.05, 0.2} with beta_init 0.2 and beta lr ×10 fixed; phase 2: 20 epochs, lr 1e-3, epoch 0 candidate, encoder frozen for every model, spawn init {shared, nearest}; targets max_expert_corr < 0.8, beta < 0.4; budget 90 min (L4).
+- Verified by: committed in its own commit before the code that runs it; run_all stamps grid_commit (hash + commit time) and the report warns if the grid was uncommitted, edited, or committed after the run started.
+- Commit: "e3v2: pre-registered grid (configs/e3v2.yaml) (document.md)"
