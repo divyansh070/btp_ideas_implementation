@@ -372,7 +372,8 @@ def report(cfg, out):
           "- Whether single-head models show a leave-one-chemistry-out gap: in the E2 table, compare the `zero_shot`, "
           "`few_2` / `few_5` and `target_only` rows of each fold (same blind-test cells), and the E2 'Gap' summary for `lstm_frac`.",
           "- How the hard mask and the additive bias route an unseen chemistry: E3 results table (MoE vs `single_head` per fold "
-          "and regime, with `held_out_has_matching_expert`), the E3 diagnostics table and the mean-gate-weight-per-chemistry table.", "",
+          "and regime, with `held_out_has_matching_expert`), the E3 diagnostics table and the mean-gate-weight-per-chemistry table.",
+          *_pbt_shows(cfg, out, e2r), "",
           "## What this does NOT show", "",
           f"- Anything statistically solid: tiny N (held-out test sets of 3-6 cells, {len(cfg['seeds'])} seeds). Preliminary only.",
           "- Real-world RUL accuracy for fraction-of-life models: every `oracle_eol=True` number uses the TRUE EOL to "
@@ -440,8 +441,10 @@ def _e4_section(cfg, out, e2r):
           f"Cells PBT could not use: {notes['skipped_cells'] or 'none'}.", "",
           "PBT predicts total cycle life from the first N <= 100 cycles. For a window ending at cycle c it gets the "
           "first min(c, 100) cycles and RUL = predicted life - c (no oracle EOL, no future cycles). "
-          "Same blind-test cells as E2/E3. `PBT_finetuned` = PBT's FT recipe on the same 2 / 5 adaptation cells as E2 "
-          "few_2 / few_5, best epoch by target-val MAPE (see `qr/pbt_e4.py`).", ""]
+          "Same blind-test cells as E2/E3. On the same 2 / 5 adaptation cells as E2 few_2 / few_5: `PBT_FT` = all "
+          "parameters (lr 1e-5), `PBT_AT` = PBT's adapters (width 16) + head; best epoch by target-val MAPE, where "
+          "epoch -1 (no update; for FT the pretrained model) is a candidate. `PBT_selected` = whichever of zero-shot / "
+          "FT / AT has the lowest target-val MAPE, per fold x regime x seed (see `qr/pbt_e4.py`).", ""]
     cells = pd.read_csv(out / "e4_cells.csv")
     leak = (cells.drop_duplicates(["fold", "cell"]).groupby(["fold", "pbt_split"]).size().unstack(fill_value=0)
             .reindex(columns=["train", "val", "test", "none"], fill_value=0).reset_index())
@@ -456,35 +459,69 @@ def _e4_section(cfg, out, e2r):
     both = both.sort_values(["fold", "regime"], key=lambda c: c.map({r: i for i, r in enumerate(regs)}) if c.name == "regime" else c)
     tab = summarise(both, ["fold", "regime", "model", "subset", "oracle_eol"])
     L += ["E4 next to E2 on the same folds, regimes and test cells:", "", md_table(tab), ""]
-    L += ["**Track A gate (per fold): does fine-tuned PBT still leave a gap vs target-only?** "
-          "Compared: PBT_finetuned with the most adaptation cells available (few_5, else few_2) vs the best E2 "
-          "target_only model, mean RMSE "
-          "± std over seeds. target_only trains on the full 60 % adaptation set; `lstm_frac` / `lgbm` use oracle EOL, "
-          "`lstm_rul` does not.", ""]
+    if "chosen" in e4r:
+        ch = e4r[e4r.model == "PBT_selected"].groupby(["fold", "regime", "chosen"]).size().unstack(fill_value=0)
+        L += ["Which PBT variant target-val selected (count over seeds):", "", md_table(ch.reset_index()), ""]
+    seen = (cells.drop_duplicates(["fold", "cell"]).assign(seen=lambda d: d.pbt_split.isin(["train", "val"]))
+            .groupby("fold").seen.mean())
+    L += ["**Track A gate (per fold): does the best PBT variant still leave a gap vs target-only?** PBT_selected "
+          "(chosen on target val among zero-shot / FT / AT) with the most adaptation cells available, vs the "
+          "**non-oracle** E2 target_only `lstm_rul` (main comparison; same no-oracle footing as PBT), mean RMSE ± std "
+          "over seeds. target_only trains on the full 60 % adaptation set. The best oracle-EOL target_only model is "
+          "shown for reference. Leakage = share of the fold's test cells that PBT trained or selected on.", ""]
     for fold in cfg["folds"]:
-        L.append(f"- {fold}: " + _gate_verdict(e4r[e4r.fold == fold], ref[ref.fold == fold] if len(ref) else ref))
+        L.append(f"- {fold}: " + _gate_verdict(e4r[e4r.fold == fold], ref[ref.fold == fold] if len(ref) else ref,
+                                               float(seen.get(fold, np.nan))))
     return L + [""]
 
 
-def _gate_verdict(e4f, e2f):
-    ft = e4f[e4f.model == "PBT_finetuned"]
-    if ft.empty or e2f.empty or not (e2f.regime == "target_only").any():
-        return "not decidable (no PBT_finetuned or no E2 target_only rows)."
-    reg = max(set(ft.regime), key=lambda r: int(r.split("_")[1]))   # most adaptation cells
-    ft = ft[ft.regime == reg].rmse
-    if ft.empty:
-        return "not decidable (no PBT_finetuned or no E2 target_only rows)."
+def _pbt_shows(cfg, out, e2r):
+    """'What this shows' line on released PBT vs our models, computed from the E4 / E2 / E5 tables."""
+    if not (out / "e4_raw.csv").exists() or e2r is None:
+        return []
+    e4r = pd.read_csv(out / "e4_raw.csv")
+    zs = e4r[(e4r.model == "PBT_zero_shot") & (e4r.get("subset", "all_test_cells") == "all_test_cells")]
+    ours = [e2r]
+    if (out / "e5_raw.csv").exists():
+        ours.append(pd.read_csv(out / "e5_raw.csv").assign(model=lambda d: d.variant + "/" + d.label))
+    ours = pd.concat(ours, ignore_index=True).groupby(["fold", "regime", "model"]).rmse.mean().groupby("fold").min()
+    pbt = zs.groupby("fold").rmse.mean()
+    folds = [f for f in cfg["folds"] if f in pbt and f in ours]
+    wins = [f for f in folds if pbt[f] < ours[f]]
+    seen = ""
+    if (out / "e4_cells.csv").exists():
+        c = pd.read_csv(out / "e4_cells.csv").drop_duplicates(["fold", "cell"])
+        seen = f" {c.pbt_split.isin(['train', 'val']).mean():.0%} of these test cells were in PBT's train/val split."
+    return [f"- Released PBT zero-shot has a lower mean RMSE than every one of our models (E2/E5, any regime, incl. "
+            f"target-only and oracle-EOL ones) on {len(wins)} of {len(folds)} folds ({', '.join(wins) or 'none'})."
+            + (" These chemistries are all seen in PBT's pretraining, so this is largely leakage:" if wins else
+               " All four chemistries are in PBT's pretraining data:") + seen +
+            " PBT also gets more information than our window models: the first min(c, 100) cycles of the cell "
+            "(early-life history) and the current cycle index c (RUL = predicted life - c)."]
+
+
+def _gate_verdict(e4f, e2f, leak):
+    lk = f"leakage {leak:.0%}" if np.isfinite(leak) else "leakage n/a"
+    sel = e4f[e4f.model == "PBT_selected"]
+    if sel.empty or e2f.empty or not (e2f.regime == "target_only").any():
+        return f"{lk}; not decidable (no PBT_selected or no E2 target_only rows)."
+    reg = max(set(sel.regime), key=lambda r: int(r.split("_")[1]))   # most adaptation cells
+    sel = sel[sel.regime == reg]
     to = e2f[e2f.regime == "target_only"].groupby("model").rmse.agg(["mean", "std"]).fillna(0)
-    best = to["mean"].idxmin()
-    nonor = "lstm_rul" if "lstm_rul" in to.index else best
-    m, sd = ft.mean(), (ft.std() if len(ft) > 1 else 0.0)
-    b, bs = to.loc[best, "mean"], to.loc[best, "std"]
-    verdict = ("gap remains (PBT-FT worse by more than 1 std each)" if m - sd > b + bs else
-               "no gap (PBT-FT better by more than 1 std each)" if m + sd < b - bs else "within noise")
-    return (f"PBT_finetuned {reg} RMSE {m:.0f} ± {sd:.0f} vs target_only {best} {b:.0f} ± {bs:.0f}"
-            f"{' (oracle EOL)' if best != 'lstm_rul' else ''}; non-oracle target_only {nonor} "
-            f"{to.loc[nonor, 'mean']:.0f} ± {to.loc[nonor, 'std']:.0f} -> **{verdict}**"
-            f"{' (single seed)' if len(ft) < 2 else ''}.")
+    if "lstm_rul" not in to.index:
+        return f"{lk}; not decidable (no non-oracle lstm_rul target_only rows)."
+    m, sd = sel.rmse.mean(), (sel.rmse.std() if len(sel) > 1 else 0.0)
+    b, bs = to.loc["lstm_rul", "mean"], to.loc["lstm_rul", "std"]
+    oracle = to.drop(index="lstm_rul")
+    ref = (f"; oracle-EOL target_only {oracle['mean'].idxmin()} {oracle['mean'].min():.0f}" if len(oracle) else "")
+    chosen = ", ".join(f"{k} {v}" for k, v in sel.chosen.value_counts().items()) if "chosen" in sel else "n/a"
+    nums = (f"PBT_selected {reg} RMSE {m:.0f} ± {sd:.0f} (chosen: {chosen}) vs non-oracle target_only lstm_rul "
+            f"{b:.0f} ± {bs:.0f}{ref}")
+    if np.isfinite(leak) and leak > 0.5:
+        return f"{lk}; {nums} -> **gate not testable on this fold: PBT pretrained on these cells**."
+    verdict = ("gap remains (PBT worse by more than 1 std each)" if m - sd > b + bs else
+               "no gap (PBT better by more than 1 std each)" if m + sd < b - bs else "within noise")
+    return f"{lk}; {nums} -> **{verdict}**{' (single seed)' if len(sel) < 2 else ''}."
 
 
 def _match_table(prep, folds):

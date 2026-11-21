@@ -231,11 +231,12 @@ def test_cached_e3_is_marked_and_force_reruns(tmp_path, monkeypatch):
 
 
 class FakePBT:
-    """Test double with PBTAdapter's interface: life = (1 + bias) * true EOL; fine-tuning removes the bias."""
+    """Test double with PBTAdapter's interface: life = (1 + bias) * true EOL. Fine-tuning sets the bias per method
+    (or makes it worse with worse=True); like the real adapter, the best epoch incl. epoch -1 (no update) is kept."""
     info = {"device": "cpu", "checkpoint": "fake"}
 
-    def __init__(self, eol, missing=()):
-        self.eol, self.missing, self.bias, self.finetunes = eol, set(missing), 0.3, 0
+    def __init__(self, eol, missing=(), worse=False):
+        self.eol, self.missing, self.bias, self.worse, self.finetunes = eol, set(missing), 0.3, worse, []
 
     def inputs(self, name):
         if name in self.missing:
@@ -245,9 +246,11 @@ class FakePBT:
     def life(self, name):
         return np.full(100, (1 + self.bias) * self.eol[name])
 
-    def finetune(self, train, val, cfg, seed):
-        self.bias, self.finetunes = 0.05, self.finetunes + 1
-        return [dict(epoch=0, val_mape_life=0.05)]
+    def finetune(self, train, val, cfg, seed, method="FT"):
+        new = 0.6 if self.worse else {"FT": 0.05, "AT": 0.1}[method]
+        self.finetunes.append(method)
+        self.bias = min(0.3, new)                                    # best of epoch -1 (0.3) and epoch 0
+        return [dict(epoch=-1, val_mape_life=0.3), dict(epoch=0, val_mape_life=new)]
 
     def reset(self):
         self.bias = 0.3
@@ -268,10 +271,12 @@ def test_e4_with_fake_pbt(tmp_path, monkeypatch):
     monkeypatch.setattr(run_all, "E4_ADAPTER", fake)
     run_all.main(["--data", str(data), "--out", str(out), "--steps", "e4,report", "--force", "e4"], cfg=cfg)
     r = pd.read_csv(out / "e4_raw.csv")
-    assert set(r.model) == {"PBT_zero_shot", "PBT_finetuned"} and (~r.oracle_eol).all() and np.isfinite(r.rmse).all()
-    assert r.code_commit.notna().all() and fake.finetunes > 0
-    zs, ft = r[r.model == "PBT_zero_shot"], r[r.model == "PBT_finetuned"]
-    assert ft.rmse.mean() < zs[zs.subset == "all_test_cells"].rmse.mean()   # fake fine-tune removes most of the bias
+    assert set(r.model) == {"PBT_zero_shot", "PBT_FT", "PBT_AT", "PBT_selected"}
+    assert (~r.oracle_eol).all() and np.isfinite(r.rmse).all() and r.code_commit.notna().all()
+    assert {"FT", "AT"} <= set(fake.finetunes)
+    zs, ft = r[r.model == "PBT_zero_shot"], r[r.model == "PBT_selected"]
+    assert set(ft.chosen) == {"PBT_FT"}                                 # lowest target-val MAPE (0.05)
+    assert ft.rmse.mean() < zs[zs.subset == "all_test_cells"].rmse.mean()
     assert set(zs.subset) <= {"all_test_cells", "pbt_test_split_only"}
     c = pd.read_csv(out / "e4_cells.csv")
     assert set(c.pbt_split) <= {"train", "val", "test", "none"} and not c[c.cell.str.contains("NMC_15C")].used.any()
@@ -281,9 +286,23 @@ def test_e4_with_fake_pbt(tmp_path, monkeypatch):
         assert s in rep, s
     verdicts = [l for l in rep.split("Track A gate")[1].splitlines() if l.startswith("- ")][:len(cfg["folds"])]
     assert len(verdicts) == len(cfg["folds"])
-    for f in cfg["folds"]:  # a verdict wherever PBT was fine-tuned; "not decidable" only where it could not be
+    leak = c.drop_duplicates(["fold", "cell"]).assign(s=lambda d: d.pbt_split.isin(["train", "val"])).groupby("fold").s.mean()
+    for f in cfg["folds"]:  # verdict with leakage share; leakage > 50 % -> not testable
         v = next(x for x in verdicts if x.startswith(f"- {f}: "))
-        assert ("->" in v) == (f in set(ft.fold)), v
+        assert "leakage" in v and "non-oracle target_only lstm_rul" in v or "not decidable" in v, v
+        if f in set(ft.fold):
+            assert ("not testable" in v) == (leak[f] > 0.5), (v, leak[f])
+    assert "Released PBT zero-shot has a lower mean RMSE than every one of our models" in rep
+
+    # a fine-tune that only hurts must fall back to epoch -1, i.e. reproduce zero-shot exactly
+    monkeypatch.setattr(run_all, "E4_ADAPTER", FakePBT(dict(zip(cells.name, cells.eol)), worse=True))
+    run_all.main(["--data", str(data), "--out", str(out), "--steps", "e4", "--force", "e4"], cfg=cfg)
+    r = pd.read_csv(out / "e4_raw.csv")
+    z = r[(r.model == "PBT_zero_shot") & (r.subset == "all_test_cells")].set_index(["fold", "seed"]).rmse
+    for m in ("PBT_FT", "PBT_AT"):
+        f = r[r.model == m]
+        assert (f.selected_epoch == -1).all()
+        assert np.allclose(f.set_index(["fold", "seed"]).rmse, z.loc[f.set_index(["fold", "seed"]).index])
 
 
 PBT_REPO = ROOT.parent / "third_party" / "PBT"
@@ -337,10 +356,21 @@ def test_e4_real_pbt_code_with_tiny_fake_checkpoint(tmp_path):
     cfg.update(folds=["NMC"])
     cfg["e4"]["finetune"].update(regimes=["few_1"], epochs=1)
     rows, cells, hist, notes = pbt_e4.run_e4(prep, cfg, ad)
-    assert {r["model"] for r in rows} == {"PBT_zero_shot", "PBT_finetuned"} and all(np.isfinite(r["rmse"]) for r in rows)
-    assert len(hist) == 1 and notes["e4b_seeds"] == [0]
+    assert {r["model"] for r in rows} == {"PBT_zero_shot", "PBT_FT", "PBT_AT", "PBT_selected"}
+    assert all(np.isfinite(r["rmse"]) for r in rows) and notes["e4b_seeds"] == [0]
+    h = pd.DataFrame(hist)
+    assert set(h.method) == {"FT", "AT"} and set(h.epoch) == {-1, 0}   # epoch -1 = before any update
+    from qr.features import make_split
+    sp = make_split(prep["chem"], "NMC", 0, cfg["split"])
+    val_names = [prep["cells"][ci]["name"] for ci in (list(sp["val"]) or list(sp["adapt"][:1]))]
     ad.reset()
-    assert np.allclose(ad.life(name), life, rtol=1e-2)                  # reset restores the pretrained weights
+    ft0 = h[(h.method == "FT") & (h.epoch == -1)].val_mape_life.iloc[0]
+    assert np.isclose(ft0, ad.val_mape(val_names))                      # FT epoch -1 is exactly the pretrained model
+    assert np.allclose(ad.life(name), life, rtol=1e-2)                  # base model untouched by FT / AT
+    m, params = ad._with_adapters(16)                                   # AT trains adapters + head only
+    n_all = sum(p.numel() for p in m.parameters())
+    assert 0 < sum(p.numel() for p in params) < n_all and all(any(k in n for k in ("adapter", "regression_head"))
+                                                              for n, p in m.named_parameters() if any(p is q for q in params))
 
 
 

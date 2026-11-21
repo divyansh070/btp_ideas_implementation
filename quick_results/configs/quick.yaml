@@ -53,12 +53,14 @@ e4:
   device: auto                   # cuda if bf16 autocast works on it, else cpu
   pbt_repo: null                 # null -> ../third_party/PBT if present, else clone PBT pinned to 74f03a7
   budget_minutes: 55             # E4a + E4b; E4b stops adding seeds when the next one would exceed this
-  finetune:                      # E4b: PBT's FT recipe (all params, Adam wd 0, MSE on scaled life, batch 32)
+  finetune:                      # E4b: PBT's recipes (Adam wd 0, MSE on scaled life, batch 32), epoch -1 = no update
     enabled: true
     regimes: [few_2, few_5]      # same adaptation cells as E2 few_2 / few_5
     epochs: 10
-    lr: 0.0001
     batch: 32
+    methods:
+      FT: {lr: 0.00001}                    # all parameters, PBT's lower lr bound
+      AT: {lr: 0.000025, adapter_size: 16} # PBT adapters + head; lr = finetune_PBT.sh default
 
 e5:                              # text description vs cross-chemistry RUL (paired variants, see qr/e5.py)
   seeds: [0, 1, 2, 3, 4]

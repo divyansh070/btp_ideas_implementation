@@ -9,10 +9,16 @@ BatteryLifeConfig accepts text_config=None (default LlamaConfig(), no download, 
 With PBT's cached prompt embeddings neither is needed, so the tokenizer is stubbed and no HF token is required.
 
 E4b: PBT's finetune_model.py cannot be pointed at our split (dataset names map to PBT's own split lists; it calls
-wandb.init and rewrites args from args.json), so `finetune` reproduces its FT recipe instead: all parameters,
-Adam (wd = 0), lr 1e-4, MSE on label-scaled cycle life, batch 32, every prefix N = 1..100 of each training cell,
-best epoch by validation MAPE. Differences: fixed epoch count instead of patience 30 / least_epochs 50, bf16 autocast
-instead of accelerate's bf16 mixed precision, no LR warm-up, dropout 0 (finetune_PBT.sh uses dropout=0 too).
+wandb.init and rewrites args from args.json), so `finetune` reproduces its recipes instead:
+  FT  all parameters, lr 1e-5 (PBT's lower bound);
+  AT  PBT's PBTtLayerWithAdapter (width 16) after the CyclePatch layer and every MoE layer, adapters + regression head
+      trained (finetune_model.py 'AT' branch, add_adapters_to_PBT_withCP_flex, adapter_layers=-1), lr 2.5e-5
+      (finetune_PBT.sh default);
+both: Adam (wd = 0), MSE on label-scaled cycle life, batch 32, every prefix N = 1..100 of each training cell, best
+epoch by target-val MAPE where epoch -1 (before any update; for FT the pretrained model itself) is a candidate.
+PBT_selected picks zero-shot / FT / AT per fold x regime x seed by target-val MAPE. Differences from PBT's script:
+fixed epoch count instead of patience 30 / least_epochs 50, bf16 autocast instead of accelerate's bf16 mixed
+precision, no LR warm-up, dropout 0 (finetune_PBT.sh uses dropout=0 too).
 """
 import contextlib
 import copy
@@ -125,10 +131,11 @@ class PBTAdapter:
                 args["pca_path"] = str(Path(work) / "pca_unused.pkl")
                 Path(work).mkdir(parents=True, exist_ok=True)
                 pickle.dump(None, open(args["pca_path"], "wb"))
-            self.model = PBT.Model(BatteryLifeConfig(BatteryElectrochemicalConfig(args), None))
-            load_checkpoint_in_model(self.model, str(ckpt))
-            self.model.to(device).eval()
-            self.pretrained = copy.deepcopy(self.model.state_dict())
+            from layers.Adapters import PBTtLayerWithAdapter
+            self.base = PBT.Model(BatteryLifeConfig(BatteryElectrochemicalConfig(args), None))
+            load_checkpoint_in_model(self.base, str(ckpt))
+            self.base.to(device).eval()
+            self.model, self.Adapter = self.base, PBTtLayerWithAdapter
             ls = joblib.load(Path(ckpt) / "label_scaler")
             self.mean, self.std = float(ls.mean_[-1]), float(np.sqrt(ls.var_[-1]))
             ds = Dataset_PBT.__new__(Dataset_PBT)
@@ -196,22 +203,45 @@ class PBTAdapter:
         return np.concatenate(out) * self.std + self.mean
 
     def reset(self):
-        self.model.load_state_dict(self.pretrained)
+        self.model = self.base  # the untouched pretrained model; fine-tunes never modify it
 
-    def finetune(self, train, val, cfg, seed):
-        """PBT's FT recipe on `train` cells, best epoch by val MAPE on cycle life. Returns per-epoch history."""
+    def _with_adapters(self, size):
+        """PBT's AT: adapters after the CyclePatch layer and every intra/inter MoE layer
+        (finetune_model.py add_adapters_to_PBT_withCP_flex with adapter_layers=-1 -> all); train adapters + head."""
+        m, conf = copy.deepcopy(self.base), Namespace(**self.args)
+        m.flattenIntraCycleLayer = self.Adapter(conf, m.flattenIntraCycleLayer, adapter_size=size)
+        for layers in (m.intra_MoE_layers, m.inter_MoE_layers):
+            for i in range(len(layers)):
+                layers[i] = self.Adapter(conf, layers[i], adapter_size=size)
+        m.to(self.device)
+        params = [p for n, p in m.named_parameters() if "adapter" in n or "regression_head" in n]
+        return m, params
+
+    def val_mape(self, val):
+        return float(np.mean([np.mean(np.abs(self.life(n) - self.inputs(n)[4]) / self.inputs(n)[4]) for n in val]))
+
+    def finetune(self, train, val, cfg, seed, method="FT"):
+        """PBT's FT (all params) or AT (adapters + head) on `train` cells. Epoch -1 = before any update (for FT that
+        is the pretrained model) is a selection candidate; best epoch by val MAPE on cycle life. Returns history."""
         t = self.torch
         t.manual_seed(seed)
         np.random.seed(seed)
-        self.reset()
+        if method == "FT":
+            self.model = copy.deepcopy(self.base)
+            params = list(self.model.parameters())
+        elif method == "AT":
+            self.model, params = self._with_adapters(cfg["adapter_size"])
+        else:
+            raise ValueError(method)
         data = [self.inputs(n) for n in train]
         X = np.concatenate([d[0] for d in data])
         A = np.concatenate([d[1] for d in data])
         E = np.concatenate([np.repeat(d[2][None], len(d[0]), 0) for d in data])
         M = np.concatenate([np.repeat(d[3][None], len(d[0]), 0) for d in data])
         y = np.concatenate([np.full(len(d[0]), (d[4] - self.mean) / self.std, np.float32) for d in data])
-        opt = t.optim.Adam(self.model.parameters(), lr=cfg["lr"], weight_decay=0.0)
-        best, best_state, hist = np.inf, copy.deepcopy(self.model.state_dict()), []
+        opt = t.optim.Adam(params, lr=cfg["lr"], weight_decay=0.0)
+        best = self.val_mape(val)
+        best_state, hist = copy.deepcopy(self.model.state_dict()), [dict(epoch=-1, train_loss_last=np.nan, val_mape_life=best)]
         rng = np.random.default_rng(seed)
         for ep in range(cfg["epochs"]):
             self.model.train()
@@ -221,7 +251,7 @@ class PBTAdapter:
                 loss = t.nn.functional.mse_loss(pred, t.as_tensor(y[b], device=self.device))
                 loss.backward()
                 opt.step()
-            v = float(np.mean([np.mean(np.abs(self.life(n) - self.inputs(n)[4]) / self.inputs(n)[4]) for n in val]))
+            v = self.val_mape(val)
             hist.append(dict(epoch=ep, train_loss_last=float(loss), val_mape_life=v))
             if v < best:
                 best, best_state = v, copy.deepcopy(self.model.state_dict())
@@ -240,7 +270,7 @@ def _score(prep, test_cells, life_of, base):
 
 def run_e4(prep, cfg, adapter, log=print):
     """Returns (rows, cell_rows, history_rows, notes). `adapter` is a PBTAdapter or a test double with the same calls:
-    inputs(name), life(name), finetune(train, val, cfg, seed), reset(), split_of(name), info."""
+    inputs(name), life(name), finetune(train, val, cfg, seed, method), reset(), split_of(name), info."""
     c = cfg["e4"]
     names = [x["name"] for x in prep["cells"]]
     usable, cell_rows, skipped, zero = {}, [], {}, {}
@@ -269,6 +299,9 @@ def run_e4(prep, cfg, adapter, log=print):
             for ci in sp["test"]:
                 cell_rows.append(dict(fold=held, seed=seed, cell=names[ci], chem=prep["chem"][ci],
                                       pbt_split=adapter.split_of(names[ci]), used=bool(usable[ci])))
+            for ci in list(sp["val"]) + list(sp["adapt"]):  # pretrained lives for the zero-shot val candidate
+                if ok(ci):
+                    zero_life(ci)
             pbt_test = [ci for ci in test if adapter.split_of(names[ci]) == "test"]
             for subset, cells in (("all_test_cells", test), ("pbt_test_split_only", pbt_test)):
                 if cells:
@@ -286,19 +319,31 @@ def run_e4(prep, cfg, adapter, log=print):
         for held in cfg["folds"]:
             sp = make_split(prep["chem"], held, seed, cfg["split"])
             test = [ci for ci in sp["test"] if ok(ci)]
-            val = [names[ci] for ci in sp["val"] if ok(ci)]  # empty only with < 3 cells per chemistry (smoke test)
+            val = [ci for ci in sp["val"] if ok(ci)]  # empty only with < 3 cells per chemistry (smoke test)
             for regime in c["finetune"]["regimes"]:
                 k = int(regime.split("_")[1])
-                train = [names[ci] for ci in sp["adapt"][:k] if ok(ci)]
+                train = [ci for ci in sp["adapt"][:k] if ok(ci)]
                 if len(sp["adapt"]) < k or not train or not test:
                     continue
-                h = adapter.finetune(train, val or train, c["finetune"], seed)  # same fallback as regime_sets
-                hist += [dict(fold=held, regime=regime, seed=seed, **r) for r in h]
-                ft = {ci: adapter.life(names[ci]) for ci in test}
-                rows.append(_score(prep, test, ft.get, dict(fold=held, regime=regime, model="PBT_finetuned",
-                                                            subset="all_test_cells", seed=seed,
-                                                            n_target_train_cells=len(train))))
-                log({k2: rows[-1][k2] for k2 in ("fold", "regime", "seed", "rmse", "r2")})
+                v = val or train  # same fallback as regime_sets
+                base = dict(fold=held, regime=regime, subset="all_test_cells", seed=seed, n_target_train_cells=len(train))
+                eol = {ci: prep["cells"][ci]["eol"] for ci in v}
+                zs_val = float(np.mean([np.mean(np.abs(zero[ci] - eol[ci]) / eol[ci]) for ci in v]))
+                cands = {"PBT_zero_shot": _score(prep, test, zero_life, base | dict(model="PBT_zero_shot", selected_epoch=-1,
+                                                                                    val_mape_life=zs_val))}
+                for method, mcfg in c["finetune"]["methods"].items():
+                    h = adapter.finetune([names[ci] for ci in train], [names[ci] for ci in v], c["finetune"] | mcfg,
+                                         seed, method)
+                    hist += [dict(fold=held, regime=regime, seed=seed, method=method, **r) for r in h]
+                    sel = min(h, key=lambda r: r["val_mape_life"])
+                    ft = {ci: adapter.life(names[ci]) for ci in test}
+                    cands[f"PBT_{method}"] = _score(prep, test, ft.get, base | dict(
+                        model=f"PBT_{method}", selected_epoch=sel["epoch"], val_mape_life=sel["val_mape_life"]))
+                    rows.append(cands[f"PBT_{method}"])
+                    log({k2: rows[-1][k2] for k2 in ("fold", "regime", "seed", "model", "selected_epoch", "rmse")})
+                    adapter.reset()
+                best = min(cands, key=lambda m: cands[m]["val_mape_life"])
+                rows.append(cands[best] | dict(model="PBT_selected", chosen=best))
         seeds_done.append(seed)
     adapter.reset()
     notes |= dict(e4b_seconds=round(time.time() - t1, 1), e4b_seeds=seeds_done,
