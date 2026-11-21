@@ -50,3 +50,12 @@ e3:
 
 e4:
   enabled: false                 # notebook flag RUN_E4
+  device: auto                   # cuda if bf16 autocast works on it, else cpu
+  pbt_repo: null                 # null -> ../third_party/PBT if present, else clone PBT pinned to 74f03a7
+  budget_minutes: 55             # E4a + E4b; E4b stops adding seeds when the next one would exceed this
+  finetune:                      # E4b: PBT's FT recipe (all params, Adam wd 0, MSE on scaled life, batch 32)
+    enabled: true
+    regimes: [few_2, few_5]      # same adaptation cells as E2 few_2 / few_5
+    epochs: 10
+    lr: 0.0001
+    batch: 32

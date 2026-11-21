@@ -36,6 +36,8 @@ def load_cfg(path, use_hust=False, e4=False):
         for k, v in cfg["expected_counts_hust_extra"].items():
             cfg["expected_counts"][k] = cfg["expected_counts"].get(k, 0) + v
     cfg["e4"]["enabled"] = e4 or cfg["e4"]["enabled"]
+    if not cfg["e4"].get("pbt_repo"):
+        cfg["e4"]["pbt_repo"] = str(HERE.parent / "third_party" / "PBT")  # gitignored; absent on Colab -> clone
     return cfg
 
 
@@ -201,20 +203,44 @@ def e3(cfg, out):
 
 
 # ---------------------------------------------------------------- E4
+E4_ADAPTER = None  # tests inject a fake PBT adapter here
+E4_FILES = ("e4_raw.csv", "e4_cells.csv", "e4_finetune_history.csv", "e4_notes.json")
+
+
 def e4(cfg, data_dir, out):
     status = out / "e4_status.txt"
     if _cached(cfg, "e4", status):
         print("E4: cached")
         return "cached"
+    for f in E4_FILES:  # never let a previous E4 result survive next to a new status
+        (out / f).unlink(missing_ok=True)
     if not cfg["e4"]["enabled"]:
         status.write_text("skipped: E4 disabled (set RUN_E4=True in the notebook or pass --e4)")
         return
-    from qr.pbt_e4 import run_e4
-    rows, reason = run_e4(data_dir, _prep(out), cfg, out / "e4_work")
-    if rows:
-        pd.DataFrame(rows).to_csv(out / "e4_raw.csv", index=False)
-    status.write_text(reason)
-    print("E4:", reason)
+    _require_gate(cfg, out)
+    from qr import pbt_e4
+    prep, started, step = _prep(out), time.strftime("%Y-%m-%dT%H:%M:%S%z"), "build adapter"
+    try:
+        adapter, reason = (E4_ADAPTER, "") if E4_ADAPTER is not None else pbt_e4.build_adapter(
+            data_dir, prep, cfg, out / "e4_work")
+        if adapter is None:
+            status.write_text(reason)
+            print("E4:", reason)
+            return
+        step = "run"
+        rows, cells, hist, notes = pbt_e4.run_e4(prep, cfg, adapter)
+    except Exception as e:  # report the reason, never crash the whole run
+        import traceback
+        status.write_text(f"failed at step '{step}': {type(e).__name__}: {str(e)[:400]}")
+        print(traceback.format_exc())
+        return
+    stamp = dict(code_commit=cfg["run"]["code_commit"], e4_started=started)
+    pd.DataFrame([r | stamp for r in rows]).to_csv(out / "e4_raw.csv", index=False)
+    pd.DataFrame(cells).to_csv(out / "e4_cells.csv", index=False)
+    pd.DataFrame(hist).to_csv(out / "e4_finetune_history.csv", index=False)
+    (out / "e4_notes.json").write_text(json.dumps(notes | stamp | {"adapter": getattr(adapter, "info", {})}, indent=1))
+    status.write_text(f"ran: {len(rows)} result rows, adapter {getattr(adapter, 'info', {})}")
+    print("E4:", status.read_text())
 
 
 # ---------------------------------------------------------------- report
@@ -322,13 +348,7 @@ def report(cfg, out):
         L += _moe_vs_single(both, nomatch)
         L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]), e3r)
 
-    status = (out / "e4_status.txt").read_text() if (out / "e4_status.txt").exists() else "not run"
-    L += ["## E4: released PBT, zero-shot", "", f"Status: {status}", ""]
-    if (out / "e4_raw.csv").exists():
-        e4r = pd.read_csv(out / "e4_raw.csv")
-        L += [md_table(summarise(e4r, ["fold", "regime", "model", "test_cells_in_PBT_pretraining"])), "",
-              "PBT reads cycles 1-100 and predicts total life; RUL = predicted life - current cycle, scored on windows "
-              "ending at cycle >= 100. Not history-independent. Test cells that were in PBT's pretraining split are a leak.", ""]
+    L += _e4_section(cfg, out, e2r)
 
     L += ["## How Version 1 works end to end", "", DIAGRAM, ""]
     L += ["## What this shows", "",
@@ -342,12 +362,77 @@ def report(cfg, out):
           f"- Anything statistically solid: tiny N (held-out test sets of 3-6 cells, {len(cfg['seeds'])} seeds). Preliminary only.",
           "- Real-world RUL accuracy for fraction-of-life models: every `oracle_eol=True` number uses the TRUE EOL to "
           "convert to cycles. That is a leak in deployment (CLAUDE.md, open issue a).",
-          "- That PBT has or lacks a gap: the released PBT was pretrained on LFP/NMC/NCA/LCO cells, possibly these very "
-          "cells, so E4 is optimistic, and Track A (re-headed, fine-tuned PBT) was not run here.",
+          "- An unbiased PBT number: the released PBT was pretrained on LFP, NMC, NCA and LCO cells (13 Li-ion datasets "
+          "incl. SNL, CALCE, HNEI, HUST), often these very cells (E4 leakage table), so every E4 number is optimistic. "
+          "Leave-one-chemistry-out for PBT is only honest after re-pretraining without the held-out chemistry.",
+          "- The guide's Track A: E4 uses PBT's own task (total life from the first <= 100 cycles, RUL = life - cycle), "
+          "not a re-headed windowed-RUL PBT (A3); E4b is our reimplementation of PBT's FT recipe, not finetune_model.py, "
+          "with 10 epochs and no hyperparameter search.",
           "- The full Track B model: no Neural ODE, E=2, few epochs, no hyperparameter search, windows subsampled per cell.",
           "- Any conclusion beyond these folds: the MoE result above is reported as measured, whichever way it goes.", ""]
     (out / "REPORT.md").write_text("\n".join(L))
     print("wrote", out / "REPORT.md")
+
+
+def _e4_section(cfg, out, e2r):
+    status = (out / "e4_status.txt").read_text() if (out / "e4_status.txt").exists() else "not run"
+    rt = json.loads((out / "runtime.json").read_text()).get("e4", "n/a") if (out / "runtime.json").exists() else "n/a"
+    L = ["## E4: released PBT on our LOCO protocol", "", f"Status: {status}", f"Runtime: {rt} s", ""]
+    if not (out / "e4_raw.csv").exists():
+        return L
+    e4r = pd.read_csv(out / "e4_raw.csv")
+    notes = json.loads((out / "e4_notes.json").read_text())
+    L += [f"Code commit **{notes['code_commit']}**, started {notes['e4_started']}; adapter {notes['adapter']}. "
+          f"E4a {notes['e4a_seconds']} s, E4b {notes['e4b_seconds']} s, E4b seeds {notes['e4b_seeds']}"
+          + (" (**reduced to fit the time budget**)" if notes["e4b_seeds_reduced"] else "") + ".",
+          f"Cells PBT could not use: {notes['skipped_cells'] or 'none'}.", "",
+          "PBT predicts total cycle life from the first N <= 100 cycles. For a window ending at cycle c it gets the "
+          "first min(c, 100) cycles and RUL = predicted life - c (no oracle EOL, no future cycles). "
+          "Same blind-test cells as E2/E3. `PBT_finetuned` = PBT's FT recipe on the same 2 / 5 adaptation cells as E2 "
+          "few_2 / few_5, best epoch by target-val MAPE (see `qr/pbt_e4.py`).", ""]
+    cells = pd.read_csv(out / "e4_cells.csv")
+    leak = (cells.drop_duplicates(["fold", "cell"]).groupby(["fold", "pbt_split"]).size().unstack(fill_value=0)
+            .reindex(columns=["train", "val", "test", "none"], fill_value=0).reset_index())
+    L += ["**Leakage.** Released PBT was pretrained on all four held-out chemistries (LFP, NMC, NCA, LCO are all in "
+          "its 13 pretraining datasets). Blind-test cells by their split in PBT's own data_split_recorder "
+          "(unique cells over seeds; train/val = PBT trained or selected on them):", "", md_table(leak), "",
+          "`pbt_test_split_only` rows score only test cells that were in PBT's test split (never trained on).", ""]
+    e4r["subset"] = e4r.subset.fillna("all_test_cells")
+    regs = list(dict.fromkeys(["zero_shot"] + cfg["e4"]["finetune"]["regimes"] + ["target_only"]))
+    ref = e2r[e2r.regime.isin(regs)].assign(subset="all_test_cells") if e2r is not None else pd.DataFrame()
+    both = pd.concat([e4r, ref], ignore_index=True)
+    both = both.sort_values(["fold", "regime"], key=lambda c: c.map({r: i for i, r in enumerate(regs)}) if c.name == "regime" else c)
+    tab = summarise(both, ["fold", "regime", "model", "subset", "oracle_eol"])
+    L += ["E4 next to E2 on the same folds, regimes and test cells:", "", md_table(tab), ""]
+    L += ["**Track A gate (per fold): does fine-tuned PBT still leave a gap vs target-only?** "
+          "Compared: PBT_finetuned with the most adaptation cells available (few_5, else few_2) vs the best E2 "
+          "target_only model, mean RMSE "
+          "± std over seeds. target_only trains on the full 60 % adaptation set; `lstm_frac` / `lgbm` use oracle EOL, "
+          "`lstm_rul` does not.", ""]
+    for fold in cfg["folds"]:
+        L.append(f"- {fold}: " + _gate_verdict(e4r[e4r.fold == fold], ref[ref.fold == fold] if len(ref) else ref))
+    return L + [""]
+
+
+def _gate_verdict(e4f, e2f):
+    ft = e4f[e4f.model == "PBT_finetuned"]
+    if ft.empty or e2f.empty or not (e2f.regime == "target_only").any():
+        return "not decidable (no PBT_finetuned or no E2 target_only rows)."
+    reg = max(set(ft.regime), key=lambda r: int(r.split("_")[1]))   # most adaptation cells
+    ft = ft[ft.regime == reg].rmse
+    if ft.empty:
+        return "not decidable (no PBT_finetuned or no E2 target_only rows)."
+    to = e2f[e2f.regime == "target_only"].groupby("model").rmse.agg(["mean", "std"]).fillna(0)
+    best = to["mean"].idxmin()
+    nonor = "lstm_rul" if "lstm_rul" in to.index else best
+    m, sd = ft.mean(), (ft.std() if len(ft) > 1 else 0.0)
+    b, bs = to.loc[best, "mean"], to.loc[best, "std"]
+    verdict = ("gap remains (PBT-FT worse by more than 1 std each)" if m - sd > b + bs else
+               "no gap (PBT-FT better by more than 1 std each)" if m + sd < b - bs else "within noise")
+    return (f"PBT_finetuned {reg} RMSE {m:.0f} ± {sd:.0f} vs target_only {best} {b:.0f} ± {bs:.0f}"
+            f"{' (oracle EOL)' if best != 'lstm_rul' else ''}; non-oracle target_only {nonor} "
+            f"{to.loc[nonor, 'mean']:.0f} ± {to.loc[nonor, 'std']:.0f} -> **{verdict}**"
+            f"{' (single seed)' if len(ft) < 2 else ''}.")
 
 
 def _match_table(prep, folds):

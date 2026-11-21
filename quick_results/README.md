@@ -33,11 +33,18 @@ Routing: PBT-style hard mask vs our additive category bias, τ 2.0 → 0.5. Stag
 L_bal, L_route (annealed to 0 by 40 %), L_spec, each switchable in `configs/quick.yaml`. Logs gate weights per chemistry, β, entropy,
 expert correlation; reports the folds where the held-out chemistry has no matching expert (LFP, NCA). The Neural ODE is omitted.
 
-**E4 (optional), released PBT zero-shot.** Loads the Zenodo checkpoint and scores RUL = predicted life − current cycle on the same test
-cells. It needs the gated Llama tokenizer (Colab secret `HF_TOKEN`); otherwise it skips and the reason goes into the report. Untested end to end.
+**E4 (optional, `RUN_E4`), released PBT on our LOCO protocol.** Loads the Zenodo checkpoint (17972780) with PBT's
+own code (`third_party/PBT` if present, else a clone pinned to 74f03a7) and PBT's cached prompt embeddings. No Llama
+download or token is needed: PBT's tokenizer is never used and is stubbed. E4a: zero-shot, PBT's own input (first
+min(c, 100) cycles, 300 points each) for every blind-test window, RUL = predicted life − window end cycle, no oracle EOL.
+Scored on all test cells and on only those in PBT's own test split; a leakage table shows how many test cells PBT trained on.
+E4b: PBT's FT recipe (all parameters, Adam, lr 1e-4, MSE on scaled life, batch 32, 10 epochs, best epoch on target val)
+on the same 2 / 5 adaptation cells as E2, our loop rather than `finetune_model.py` (see `qr/pbt_e4.py`). Seeds are
+dropped if E4 would exceed `budget_minutes`. The report adds a per-fold "Track A gate" verdict vs E2 target-only.
+Failures write their reason to `e4_status.txt` instead of crashing.
 
 **Caveats.** Fraction-of-life numbers are converted to cycles with the TRUE EOL ("oracle EOL"). Test sets are 3-6 cells. The released
-PBT already saw these chemistries (possibly these cells). Model selection uses validation cells only.
+PBT already saw these chemistries (often these cells: see the E4 leakage table). Model selection uses validation cells only.
 
 **Local smoke test** (no downloads, < 1 minute on CPU): `python -m pytest -q tests/test_smoke.py` builds 6 synthetic cells (3 chemistries)
 and runs E0-E3 + report. On macOS the LightGBM parts are skipped: torch and LightGBM load two different `libomp` runtimes and segfault in

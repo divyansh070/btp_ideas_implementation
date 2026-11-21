@@ -219,3 +219,116 @@ def test_cached_e3_is_marked_and_force_reruns(tmp_path, monkeypatch):
     assert "Not labelled as run 2" in rep and "### E3 run 1 vs run 2" not in rep
     with pytest.raises(SystemExit):
         run_all.main(args + ["--force", "e9"], cfg=smoke_cfg())
+
+
+class FakePBT:
+    """Test double with PBTAdapter's interface: life = (1 + bias) * true EOL; fine-tuning removes the bias."""
+    info = {"device": "cpu", "checkpoint": "fake"}
+
+    def __init__(self, eol, missing=()):
+        self.eol, self.missing, self.bias, self.finetunes = eol, set(missing), 0.3, 0
+
+    def inputs(self, name):
+        if name in self.missing:
+            raise KeyError(f"{name}: no PBT prompt embedding")
+        return name
+
+    def life(self, name):
+        return np.full(100, (1 + self.bias) * self.eol[name])
+
+    def finetune(self, train, val, cfg, seed):
+        self.bias, self.finetunes = 0.05, self.finetunes + 1
+        return [dict(epoch=0, val_mape_life=0.05)]
+
+    def reset(self):
+        self.bias = 0.3
+
+    def split_of(self, name):
+        return "test" if name.endswith("_a") else "train"
+
+
+def test_e4_with_fake_pbt(tmp_path, monkeypatch):
+    data, out = tmp_path / "data", tmp_path / "out"
+    qd.make_synthetic(data)
+    cfg = smoke_cfg()
+    cfg["e4"].update(enabled=True)
+    cfg["e4"]["finetune"].update(regimes=["few_1"], epochs=1)
+    run_all.main(["--data", str(data), "--out", str(out), "--steps", "e0,e2"], cfg=cfg)
+    cells = pd.read_csv(out / "e0_cell_list.csv")
+    fake = FakePBT(dict(zip(cells.name, cells.eol)), missing={"SNL_18650_NMC_15C_0-100_0.5-2C_b"})
+    monkeypatch.setattr(run_all, "E4_ADAPTER", fake)
+    run_all.main(["--data", str(data), "--out", str(out), "--steps", "e4,report", "--force", "e4"], cfg=cfg)
+    r = pd.read_csv(out / "e4_raw.csv")
+    assert set(r.model) == {"PBT_zero_shot", "PBT_finetuned"} and (~r.oracle_eol).all() and np.isfinite(r.rmse).all()
+    assert r.code_commit.notna().all() and fake.finetunes > 0
+    zs, ft = r[r.model == "PBT_zero_shot"], r[r.model == "PBT_finetuned"]
+    assert ft.rmse.mean() < zs[zs.subset == "all_test_cells"].rmse.mean()   # fake fine-tune removes most of the bias
+    assert set(zs.subset) <= {"all_test_cells", "pbt_test_split_only"}
+    c = pd.read_csv(out / "e4_cells.csv")
+    assert set(c.pbt_split) <= {"train", "val", "test", "none"} and not c[c.cell.str.contains("NMC_15C")].used.any()
+    rep = (out / "REPORT.md").read_text()
+    for s in ["## E4: released PBT on our LOCO protocol", "**Leakage.**", "Track A gate", "pbt_test_split_only",
+              "no PBT prompt embedding"]:
+        assert s in rep, s
+    verdicts = [l for l in rep.split("Track A gate")[1].splitlines() if l.startswith("- ")][:len(cfg["folds"])]
+    assert len(verdicts) == len(cfg["folds"])
+    for f in cfg["folds"]:  # a verdict wherever PBT was fine-tuned; "not decidable" only where it could not be
+        v = next(x for x in verdicts if x.startswith(f"- {f}: "))
+        assert ("->" in v) == (f in set(ft.fold)), v
+
+
+PBT_REPO = ROOT.parent / "third_party" / "PBT"
+
+
+@pytest.mark.skipif(not (PBT_REPO / "models" / "PBT.py").exists(), reason="third_party/PBT not cloned")
+def test_e4_real_pbt_code_with_tiny_fake_checkpoint(tmp_path):
+    """Real PBT model/data code (pinned commit) with random tiny weights: import, no-tokenizer init, inputs, FT."""
+    import json
+    import joblib
+    import torch
+    from sklearn.preprocessing import StandardScaler
+    from qr import pbt_e4
+    from qr.features import prepare
+    data, ckpt = tmp_path / "data", tmp_path / "ckpt"
+    qd.make_synthetic(data)
+    ckpt.mkdir()
+    args = dict(task_name="battery_life_prediction", dataset="MIX_large", d_model=16, d_ff=16, min_d_ff=16, n_heads=2,
+                e_layers=1, d_layers=1, d_llm=16, gate_d_ff=64, dk_factor=1, dropout=0.0, activation="gelu",
+                charge_discharge_length=300, early_cycle_threshold=100, patch_len=10, stride=10, num_views=1,
+                down_sample_ratio=0.75, topK=-1, use_dff_scale=False, d_ff_scale_factor=None, num_general_experts=1,
+                num_experts=2, output_num=1, cathode_experts=7, anode_experts=6, format_experts=6,
+                temperature_experts=10, LLM_path="unused", pca_path="missing.pkl")
+    (ckpt / "args.json").write_text(json.dumps(args))
+    joblib.dump(StandardScaler().fit(np.array([[150.0], [250.0]])), ckpt / "label_scaler")
+    # build once to get a state dict of the right shape, save it the way load_checkpoint_in_model reads it
+    for m in pbt_e4.OPTIONAL:
+        try:
+            __import__(m)
+        except ImportError:
+            sys.modules[m] = pbt_e4._Stub(m)
+    sys.path.insert(0, str(PBT_REPO))
+    (tmp_path / "p.pkl").write_bytes(__import__("pickle").dumps(None))
+    with pbt_e4._cwd(PBT_REPO):
+        from BatteryLifeLLMUtils.configuration_BatteryLifeLLM import BatteryElectrochemicalConfig, BatteryLifeConfig
+        from models import PBT
+        PBT.AutoTokenizer = pbt_e4._NoTokenizer
+        model = PBT.Model(BatteryLifeConfig(BatteryElectrochemicalConfig(args | {"pca_path": str(tmp_path / "p.pkl")}), None))
+    torch.save(model.state_dict(), ckpt / "pytorch_model.bin")
+
+    _, kept = qd.load_cells(data, ["SNL"])
+    emb = qd.load_text_embeddings(data)
+    prep = prepare(kept, emb, cap=20)
+    ad = pbt_e4.PBTAdapter(PBT_REPO, ckpt, data, emb, tmp_path / "work", "cpu")
+    name = kept[0]["name"]
+    curves, attn, e, mask, eol = ad.inputs(name)
+    assert curves.shape[1:] == (100, 3, 300) and attn.sum(1)[0] == 1 and mask.shape == (29,) and eol == kept[0]["eol"]
+    life = ad.life(name)
+    assert life.shape == (len(curves),) and np.isfinite(life).all()
+    cfg = smoke_cfg()
+    cfg.update(folds=["NMC"])
+    cfg["e4"]["finetune"].update(regimes=["few_1"], epochs=1)
+    rows, cells, hist, notes = pbt_e4.run_e4(prep, cfg, ad)
+    assert {r["model"] for r in rows} == {"PBT_zero_shot", "PBT_finetuned"} and all(np.isfinite(r["rmse"]) for r in rows)
+    assert len(hist) == 1 and notes["e4b_seeds"] == [0]
+    ad.reset()
+    assert np.allclose(ad.life(name), life, rtol=1e-2)                  # reset restores the pretrained weights
