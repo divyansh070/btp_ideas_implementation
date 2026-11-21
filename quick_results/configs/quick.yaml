@@ -1,0 +1,51 @@
+# Quick-results proof of concept for Version 1. Target: whole run < ~1 h on a Colab T4.
+seeds: [0, 1, 2]
+
+data:
+  datasets: [SNL, CALCE, HNEI]   # USE_HUST adds HUST (LFP, 1.39 GB)
+  use_hust: false
+  window: 30                     # consecutive cycles per window
+  sampled: 10                    # cycles sampled evenly from the window
+  max_windows_per_cell: 150      # stride-1 windows, evenly subsampled to this many per cell (runtime)
+  min_cycles: 100
+
+# Gate count check. Defaults = PBT's post-filter split counts (document.md, Phase 0 audit).
+expected_counts: {LFP: 9, NMC: 21, NCA: 20, LCO: 13, NMC-LCO: 14}
+expected_counts_hust_extra: {LFP: 77}
+
+folds: [LFP, NMC, NCA, LCO]      # leave one chemistry out; NMC-LCO (HNEI) is always source
+split: {test: 0.3, val: 0.1, source_val: 0.2}   # held-out: 60 / 10 / 30 adapt / val / blind test
+
+gate:
+  allow_fail: false              # true = train even if a gate check fails (report still shows FAIL)
+  min_corr: 0.5
+  range: [-0.2, 1.2]
+  percentiles: [1, 99]           # range check on the 1st-99th percentile of each scaled target feature
+  min_std: 0.01
+
+e2:
+  regimes: [target_only, zero_shot, few_2, few_5]
+  models: [lstm_frac, lstm_rul, lgbm]
+  epochs: 15
+  batch: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  rul_scale: 1000.0
+  lgbm: {params: {n_estimators: 400, learning_rate: 0.05, num_leaves: 31, min_child_samples: 20}, early_stopping: 30}
+
+e3:
+  regimes: [zero_shot, few_2, few_5]
+  variants: [mask, bias]         # single head is taken from E2 (lstm_frac, same folds and seeds)
+  epochs_a: 8
+  epochs_b: 12
+  batch: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  tau: [2.0, 0.5]                # annealed over Stage B
+  bias: 2.0                      # additive logit bonus for a matching expert
+  route_anneal_frac: 0.4         # L_route reaches 0 at 40% of Stage B
+  losses: {mmd: 0.05, bal: 0.01, route: 0.1, spec: 0.05}   # set any to 0 to switch it off
+  gate_plot_regime: zero_shot
+
+e4:
+  enabled: false                 # notebook flag RUN_E4

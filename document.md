@@ -3,6 +3,7 @@
 ## Decisions
 - 2026-11-20 — Log entries cannot contain their own hash; "Commit:" gives the exact commit subject (`git log --grep '<subject>'` finds it).
 - 2026-11-20 — Slide deck read from `~/Downloads/PBT_to_Our_Model.pptx` (no .pptx in docs/); not copied into the repo pending user confirmation.
+- 2026-11-21 — Change of plan (user): build a self-contained Colab proof of concept in quick_results/ (code only on this Mac; data + runs on Colab T4). src/ and docs/PLAN_track_A.md untouched.
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -19,6 +20,10 @@
 - A2 acceptance band for HNEI (0.033 ± 0.010, 3 seeds, MAPE@20 cycles) is a proposal (docs/PLAN_track_A.md); needs user OK. D4 "measurable gap" definition also proposed there.
 - PBT's per-dataset numbers in the main Fig. 4 are bars only (not readable as text); A2 targets come from Supp. Table 2 (first 20 cycles), not Fig. 4.
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
+- quick_results: per-cycle features = 18 stats + 12 deltas (mean/std/min/max per signal vs window start) = 30, to match the guide's "10 cycles x 30 features" (§6.1); the guide does not define which deltas. Interpretation, needs OK.
+- quick_results gate: range check uses the 1st-99th percentile of each scaled target (val+test) feature, not strict min/max; zero-shot uses a source-only scaler (no target cells exist). Interpretations, need OK.
+- quick_results gate will likely FAIL the std > 0.01 check on real data: Qd_min is ~0 every cycle (Coulomb counting restarts), so it is constant. Seen on synthetic cells. Options: drop it from the 18 features, or ALLOW_GATE_FAIL. Needs user decision (would change the guide's feature list).
+- quick_results E3: NMC-LCO (HNEI) stays a source cell and its components {NMC, LCO} give a partial cathode match to held-out NMC and LCO, so only the LFP and NCA folds have no matching expert. When LFP is held out, 'LFP vs rest' is replaced by 'NMC vs rest'. Neural ODE omitted.
 
 ## Log
 
@@ -106,3 +111,10 @@
 - Why: correction to "Scaffold src/ and configs/" (commit d2499c8). The unanchored `data/` pattern matched `src/data/`, so `src/data/__init__.py` was silently left out of that commit.
 - Verified by: `git check-ignore -v src/data/__init__.py` → before: `.gitignore:1:data/`; after: not ignored. `data/x` and `third_party/PBT/README.md` are still ignored.
 - Commit: "fix: anchor data/ and third_party/ ignores so src/data is tracked"
+
+### 2026-11-21 16:49 — quick_results: qr package (data, features, gate, models, train, metrics, plots, E4) + config
+- Changed: quick_results/qr/{data,features,gate,models,train,metrics,plots,pbt_e4}.py, quick_results/configs/quick.yaml (new)
+- Why: user's quick-results brief (E0-E4); guide §4 (pipeline + gate), §6.2-6.7 (Track B), §6.8 (LOCO protocol). Ports PBT's pickle layout (third_party/PBT/data_provider/data_loader.py:1049-1061) and life-label rule (process_scripts/extract_life_labels.py:32-63) without importing PBT (E4 alone clones PBT inside Colab, pinned to 74f03a7).
+- Verified by: smoke test, see the run_all entry below.
+- Assumptions / risks: see the four quick_results Known issues (30-feature definition, percentile range check, Qd_min std, expert sets). Downloads use Zenodo per-file URLs (api/records/<id>/files/<name>/content) and figshare file 63780003 ("Life labels.zip"); zip internal layout unknown, so members are matched by basename. Windows capped at 150 per cell (evenly spaced) for the < 1 h runtime target. Every frac→cycles number uses the TRUE EOL and is marked oracle_eol=True: **leak flagged** (CLAUDE.md), acceptable only as a PoC upper bound; lstm_rul is the non-oracle reference. E4 is untested end to end (needs gated Llama tokenizer).
+- Commit: "quick_results: qr package and config (document.md)"
