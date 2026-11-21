@@ -57,6 +57,12 @@ def test_end_to_end(tmp_path):
     assert e2[e2.model == "lstm_rul"].oracle_eol.eq(False).all() and e2[e2.model != "lstm_rul"].oracle_eol.all()
     e3 = pd.read_csv(out / "e3_raw.csv")
     assert set(e3.model) == {"moe_mask", "moe_bias"} and np.isfinite(e3.rmse).all()
+    hist = pd.read_csv(out / "e3_history.csv")
+    for col in ["route_w", "mmd_w", "bias", "tau", "logit_gap_source", "gate_entropy_source", "gate_entropy_heldout",
+                "text_norm_raw_mean"]:
+        assert col in hist, col
+    last = hist.groupby(["fold", "regime", "variant", "seed"]).route_w.last()
+    assert (last == 0).all() and (hist.groupby(["fold", "regime", "variant", "seed"]).route_w.first() > 0).all()
     # with sets LFP|rest, held-out NCA / LFP have no matching expert; NMC folds keep one via NMC-LCO only in real data
     assert not e3[e3.fold == "NCA"].held_out_has_matching_expert.any()
     report = (out / "REPORT.md").read_text()
@@ -173,3 +179,8 @@ def test_moe_mask_without_match_is_shared_only_and_beta_trains():
     o = m(x, d, txt, match, 1.0, "bias")
     torch.nn.functional.mse_loss(o["pred"], torch.rand(4)).backward()
     assert m.beta_logit.grad is not None and m.beta_logit.grad.abs().item() > 0
+    # router input is the unit-length text embedding: rescaling the raw vector changes nothing
+    with torch.no_grad():
+        m.eval()
+        a, b = m(x, d, txt, match, 1.0, "bias"), m(x, d, 100 * txt, match, 1.0, "bias")
+    assert torch.allclose(a["logits"], b["logits"], atol=1e-5)

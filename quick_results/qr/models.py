@@ -4,6 +4,7 @@ Encoder: 2-layer LSTM(64) -> 4-head self-attention (+residual, LayerNorm) -> z =
 The guide's Neural ODE stage is omitted in this proof of concept; z is still 128-d.
 """
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -58,7 +59,8 @@ class MoE(nn.Module):
         z, disp = self.enc(x)
         f = torch.cat([e(z) for e in self.experts], 1)
         fs = self.shared(z).squeeze(-1)
-        logits = self.router(torch.cat([self.text(text), dyn, disp], 1))
+        # unit-length text embedding (run 2): raw Llama vectors are unscaled, the suspected cause of near one-hot gates in run 1
+        logits = self.router(torch.cat([self.text(F.normalize(text, dim=1)), dyn, disp], 1))
         if mode == "uniform":       # Stage A: router frozen at uniform weights
             g = torch.full_like(f, 1 / self.E)
         elif mode == "bias":        # ours: additive category bias, softmax over all experts

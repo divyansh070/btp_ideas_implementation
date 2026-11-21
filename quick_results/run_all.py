@@ -8,6 +8,7 @@ import argparse
 import json
 import pickle
 import platform
+import subprocess
 import time
 from pathlib import Path
 
@@ -244,7 +245,8 @@ def report(cfg, out):
           "60 % adaptation / 10 % validation / 30 % blind test, cell-disjoint; source 80/20 train/val.",
           "- Selection: best epoch on validation cells only (source val for zero-shot; source val + target val otherwise). "
           "The blind test is only scored.",
-          f"- Runtime (s): {rt}; host: {platform.node()} / torch device {T.DEV}.", ""]
+          f"- Runtime (s): {rt}; host: {platform.node()} / torch device {T.DEV}; code commit "
+          f"{yaml.safe_load((out / 'config_used.yaml').read_text()).get('code_commit', 'unknown')}.", ""]
     if (out / "e0_dropped_cells.csv").exists():
         dr = pd.read_csv(out / "e0_dropped_cells.csv")
         by = "; ".join(f"{n} {r}" for r, n in dr.reason.value_counts().items()) if len(dr) else "none"
@@ -291,8 +293,9 @@ def report(cfg, out):
         both["held_out_has_matching_expert"] = both.fold.map(match)
         L += ["## E3: mini Track B (MoE) vs single head", "", "All rows use oracle EOL.", "",
               md_table(summarise(both, ["fold", "held_out_has_matching_expert", "regime", "model"])), ""]
-        diag = e3r.groupby(["fold", "regime", "model"])[["beta", "gate_entropy", "gate_mean_e0", "gate_mean_e1",
-                                                         "max_expert_corr", "val_pred_min", "val_pred_max"]].mean().round(3)
+        cols = ["beta", "gate_entropy", "gate_entropy_source", "gate_entropy_heldout", "logit_gap_over_tau_source",
+                "gate_mean_e0", "gate_mean_e1", "max_expert_corr", "val_pred_min", "val_pred_max", "text_norm_raw_mean"]
+        diag = e3r.groupby(["fold", "regime", "model"])[[c for c in cols if c in e3r]].mean().round(3)
         L += ["Diagnostics at the selected epoch (validation windows, mean over seeds):", "", md_table(diag.reset_index()), ""]
         gates = pd.read_csv(out / "e3_gates.csv")
         if plots.e3_gate_figure(gates[gates.set == "test"], out / "e3_gate_weights.png", cfg["e3"]["gate_plot_regime"]):
@@ -311,6 +314,7 @@ def report(cfg, out):
               "match through NMC-LCO), while held-out NCA and LFP share no component with any expert.", "",
               md_table(_match_table(prep, cfg["folds"])), ""]
         L += _moe_vs_single(both, nomatch)
+        L += _run1_vs_run2(summarise(both, ["fold", "regime", "model"]))
 
     status = (out / "e4_status.txt").read_text() if (out / "e4_status.txt").exists() else "not run"
     L += ["## E4: released PBT, zero-shot", "", f"Status: {status}", ""]
@@ -351,6 +355,40 @@ def _match_table(prep, folds):
                          held_out_components="+".join(sorted(T.components(held))),
                          matching_expert=", ".join(f"e{e}" for e in hit) or "none"))
     return pd.DataFrame(rows)
+
+
+RUN1 = HERE / "outputs_run1" / "REPORT.md"
+
+
+def _md_section_table(path, heading):
+    """First markdown table after `heading` in a previous REPORT.md, as a DataFrame of strings."""
+    lines = path.read_text().splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith(heading))
+    rows = []
+    for l in lines[i + 1:]:
+        if l.startswith("|"):
+            rows.append([c.strip() for c in l.strip("|").split("|")])
+        elif rows:
+            break
+    return pd.DataFrame(rows[2:], columns=rows[0])
+
+
+def _run1_vs_run2(run2):
+    if not RUN1.exists():
+        return []
+    try:
+        run1 = _md_section_table(RUN1, "## E3")
+    except (StopIteration, ValueError) as e:
+        return [f"Run-1 comparison skipped: could not read the E3 table in {RUN1.name} ({e}).", ""]
+    keys = ["fold", "regime", "model"]
+    m = run1[keys + ["rmse", "r2", "mape50"]].merge(run2[keys + ["rmse", "r2", "mape50"]], on=keys, how="outer",
+                                                     suffixes=(" run1", " run2"))
+    m = m[keys + [f"{c} {r}" for c in ("rmse", "r2", "mape50") for r in ("run1", "run2")]].fillna("n/a")
+    return ["### E3 run 1 vs run 2", "",
+            "Run 2 differs from run 1 only by the unit-length normalisation of the text embedding at the router "
+            "input (`qr/models.py`, MoE.forward). Same prepared.pkl, config, seeds and splits. The added per-epoch "
+            "logging does not change training. `single_head` rows come from E2, so they are identical by construction. "
+            "Run 1 is read from `outputs_run1/REPORT.md`.", "", md_table(m), ""]
 
 
 def _gap_lines(e2r):
@@ -395,7 +433,12 @@ def main(argv=None, cfg=None):
     cfg["gate"]["allow_fail"] = cfg["gate"]["allow_fail"] or a.allow_gate_fail
     data_dir, out = Path(a.data), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config_used.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    try:
+        commit = subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], capture_output=True,
+                                text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = "unknown"
+    (out / "config_used.yaml").write_text(yaml.safe_dump(cfg | {"code_commit": commit}, sort_keys=False))
     if a.download:
         qd.download(data_dir, cfg["data"]["datasets"], pbt_ckpt=cfg["e4"]["enabled"])
     steps = a.steps.split(",")

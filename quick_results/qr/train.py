@@ -154,10 +154,15 @@ def fit_moe(prep, sets_cells, held, mode, cfg, seed):
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     w, n_a, n_b = cfg["losses"], cfg["epochs_a"], cfg["epochs_b"]
     hist, best, best_state, best_tau = [], math.inf, None, cfg["tau"][0]
+    norms = torch.cat([tr["text"], va["text"]]).norm(dim=1)   # raw (pre-normalisation) embedding norms of this run
+    text_norm = dict(text_norm_raw_mean=norms.mean().item(), text_norm_raw_min=norms.min().item(),
+                     text_norm_raw_max=norms.max().item())
     for ep in range(n_a + n_b):
         stage_a = ep < n_a
         p = 0.0 if stage_a else (ep - n_a) / max(n_b - 1, 1)  # Stage-B progress in [0, 1]
         tau = cfg["tau"][0] + (cfg["tau"][1] - cfg["tau"][0]) * p
+        r = w["route"] * max(0.0, 1 - p / cfg["route_anneal_frac"])  # annealed to 0 by 40% of Stage B
+        mmd_w = w["mmd"] * (2 / (1 + math.exp(-10 * p)) - 1)
         model.train()
         for b in _batches(len(tr["y"]), cfg["batch"], True):
             o = model(tr["x"][b], tr["d"][b], tr["text"][b], tr["match"][b], tau, "uniform" if stage_a else mode)
@@ -169,10 +174,9 @@ def fit_moe(prep, sets_cells, held, mode, cfg, seed):
             else:
                 loss = F.mse_loss(o["pred"], y)
                 if w["mmd"]:
-                    loss = loss + w["mmd"] * (2 / (1 + math.exp(-10 * p)) - 1) * _mmd(o["z"], tr["grp"][b])
+                    loss = loss + mmd_w * _mmd(o["z"], tr["grp"][b])
                 if w["bal"]:
                     loss = loss + w["bal"] * (model.E * (o["g"].mean(0) ** 2).sum() - 1)
-                r = w["route"] * max(0.0, 1 - p / cfg["route_anneal_frac"])  # annealed to 0 by 40% of Stage B
                 if r and has.any():
                     loss = loss + r * F.cross_entropy(o["logits"][has] / tau, own[has])
                 if w["spec"] and has.any():
@@ -184,7 +188,8 @@ def fit_moe(prep, sets_cells, held, mode, cfg, seed):
             continue
         o = _moe_eval(model, va, tau, mode, cfg["batch"])
         v = F.mse_loss(o["pred"], va["y"]).item()
-        hist.append(dict(epoch=ep, tau=round(tau, 3), val_mse=v, **diagnostics(o)))
+        hist.append(dict(epoch=ep, tau=round(tau, 3), route_w=r, mmd_w=mmd_w, bias=cfg["bias"], val_mse=v,
+                         **diagnostics(o), **_routing_split(o, va["own"] < 0, tau), **text_norm))
         if v < best:
             best, best_state, best_tau = v, copy.deepcopy(model.state_dict()), tau
     model.load_state_dict(best_state)
@@ -196,7 +201,20 @@ def _moe_eval(model, t, tau, mode, bs):
     model.eval()
     outs = [model(t["x"][b], t["d"][b], t["text"][b], t["match"][b], tau, mode)
             for b in _batches(len(t["y"]), bs, False)]
-    return {k: torch.cat([o[k] for o in outs]) for k in ("pred", "g", "f", "fs")} | {"beta": outs[0]["beta"]}
+    return {k: torch.cat([o[k] for o in outs]) for k in ("pred", "g", "f", "fs", "logits")} | {"beta": outs[0]["beta"]}
+
+
+def _routing_split(o, held, tau):
+    """Router logit gap |l0 - l1| (raw and /tau) and gate entropy, separately for source and held-out val windows."""
+    out = {}
+    for name, m in (("source", ~held), ("heldout", held)):
+        if m.any():
+            gap = (o["logits"][m, 0] - o["logits"][m, 1]).abs().mean().item() if o["logits"].shape[1] == 2 else float("nan")
+            ent = -(o["g"][m] * torch.log(o["g"][m] + 1e-9)).sum(1).mean().item()
+        else:  # zero-shot: no held-out cell in validation
+            gap = ent = float("nan")
+        out |= {f"logit_gap_{name}": gap, f"logit_gap_over_tau_{name}": gap / tau, f"gate_entropy_{name}": ent}
+    return out
 
 
 def diagnostics(o):

@@ -11,6 +11,7 @@
 - 2026-11-21 — Notebook default USE_HUST=True (+77 LFP cells, 1.39 GB).
 - 2026-11-21 — quick_results: cells without a PBT prompt embedding are dropped (config `data.text_embedding_missing: drop|error`, default drop), never zero-filled. They are listed in e0_dropped_cells.csv, REPORT setup and the gate table.
 - 2026-11-21 — **Deviation from guide §4:** deltas `d_V_max`, `d_V_min`, `d_I_C_max` dropped (base `V_max`, `V_min`, `I_C_max` kept). They are protocol-fixed (cutoff voltages, max C-rate), so their within-window deltas are ~0 by construction. Colab E0 gate failed only on "min feature std > 0.01" in all 4 folds (0.0042–0.0056), caused by exactly these three. Per-cycle features = 17 stats + 8 deltas = 25.
+- 2026-11-21 — Approved 3(a)+(b): the text embedding is normalised to unit length at the router input (MoE.forward), not in prepare(), so prepared.pkl and E0–E2 stay valid. Per-epoch routing/schedule logging goes in e3_history.csv. 3(c) (bias / route-CE ablation) skipped for now.
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -29,7 +30,7 @@
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
 - quick_results E3: HNEI (NMC-LCO) is always a source cell; its components {NMC, LCO} give held-out NMC and LCO a partial cathode match, so only the LFP and NCA folds have no matching expert. Neural ODE omitted.
 - quick_results: other possibly-constant features, NOT dropped, awaiting user decision. `Qd_median` is constant by construction if Qd is 0 during charge and charge takes ≥ 50 % of a cycle's samples (likely, unverified on real data). Inside one cell, protocol-fixed features (`V_max`, `I_C_min`, `I_C_max`, `I_C_median`) and their deltas barely move; they vary across cells, so the std gate does not catch them. E0 now writes `e0_feature_constancy.csv` to settle this on real data.
-- quick_results E3 run 1: source gate weights near one-hot (entropy ~0.01) with the bias variant on real data, but 0.28 on synthetic cells with the same code. Leading hypothesis (unverified, needs e3_history.csv / embedding norms from Colab): raw 4096-d Llama embeddings enter the router unscaled, so the router logits are large from the start. Proposed fix awaiting user OK (see the run-1 investigation entry).
+- quick_results E3 run 2 pending: does unit-length text normalisation remove the near one-hot source gates (run 1 entropy ~0.01)? Check gate_entropy_source / logit_gap_over_tau_source and text_norm_raw_* in e3_history.csv.
 
 ## Log
 
@@ -184,3 +185,10 @@
 - Changed: quick_results/run_all.py (E3 report text + _match_table), quick_results/tests/test_smoke.py (new test). qr/models.py unchanged.
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 5 passed, 1 skipped (LightGBM, macOS), 6.7 s. `run_all._match_table` on the real chemistry set → table above.
 - Commit: "quick_results: E3 run-1 investigation, matching-rule explanation, MoE unit test (document.md)"
+
+### 2026-11-21 19:45 — quick_results: unit-length text embedding at the router, per-epoch routing log, run-1 vs run-2 table
+- Changed: quick_results/qr/models.py (MoE.forward: `F.normalize(text, dim=1)` before the text projection), qr/train.py (fit_moe: per-epoch route_w, mmd_w, bias, tau, logit_gap / logit_gap_over_tau and gate_entropy separately for source and held-out validation windows; raw text-embedding norm mean/min/max per run; these also flow into e3_raw.csv at the selected epoch; _moe_eval also returns logits), run_all.py (diagnostics table extended; "E3 run 1 vs run 2" table read from outputs_run1/REPORT.md; code_commit written to config_used.yaml and REPORT setup), quick_results_colab.ipynb (clone cell: `git pull --ff-only` so a live session picks up new code), tests/test_smoke.py (logits unchanged when the raw embedding is ×100; e3_history has the new columns; route_w > 0 at the first Stage-B epoch and 0 at the last), quick_results/outputs_run1/REPORT.md (user's Colab run 1, committed so Colab can read it; content is results only).
+- Why: user approval of 3(a)+(b) after the run-1 investigation.
+- Run-1 provenance: outputs_run1/REPORT.md has the 25-feature diagram and lacks the matching table from 253c496 ⇒ run 1 used d7588be. d7588be → this commit changes model code only by the normalisation; seeds, config and prepared.pkl are unchanged, and the added eval-time logging uses no RNG. So run 2 differs from run 1 only by the normalisation. Run-1 totals: E0 272 s, E2 512 s, E3 1684 s on T4.
+- Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 5 passed, 1 skipped (LightGBM, macOS). Synthetic run renders "### E3 run 1 vs run 2" (run-1 rows read from outputs_run1, run-2 n/a because the synthetic folds differ) and "code commit 253c496" in setup.
+- Commit: "quick_results: unit-length text embedding, routing log, run1 vs run2 (document.md)"
