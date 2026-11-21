@@ -1,5 +1,5 @@
-data/
-third_party/
+/data/
+/third_party/
 *.pt
 *.pth
 *.ckpt

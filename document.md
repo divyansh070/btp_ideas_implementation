@@ -100,3 +100,9 @@
 - Verified by: `.venv/bin/python -c "import src.data, src.models, src.eval"` → import OK. `git status` shows no data/weights/.venv/third_party staged.
 - Assumptions / risks: no model or training code (per brief).
 - Commit: "scaffold: src/{data,models,eval} packages and configs/"
+
+### 2026-11-21 16:25 — FIX: src/data/ was gitignored
+- Changed: .gitignore (`data/` → `/data/`, `third_party/` → `/third_party/`); src/data/__init__.py now tracked
+- Why: correction to "Scaffold src/ and configs/" (commit d2499c8). The unanchored `data/` pattern matched `src/data/`, so `src/data/__init__.py` was silently left out of that commit.
+- Verified by: `git check-ignore -v src/data/__init__.py` → before: `.gitignore:1:data/`; after: not ignored. `data/x` and `third_party/PBT/README.md` are still ignored.
+- Commit: "fix: anchor data/ and third_party/ ignores so src/data is tracked"
