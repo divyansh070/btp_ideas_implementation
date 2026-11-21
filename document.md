@@ -131,3 +131,10 @@
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_smoke.py` → 2 passed, 1 skipped (LightGBM, macOS), ~4 s.
 - Assumptions / risks: requirements.txt uses lower bounds so Colab keeps its preinstalled CUDA torch; exact Colab versions are not verified from here.
 - Commit: "quick_results: run_all, smoke test, requirements (document.md)"
+
+### 2026-11-21 16:49 — quick_results: Colab notebook + README
+- Changed: quick_results/quick_results_colab.ipynb (22 cells: flags → clone → install → mount Drive → download → E0 → E1 → E2 → E3 → E4 → report), quick_results/README.md (new)
+- Why: brief; Colab badge points at github.com/divyansh070/btp_ideas_implementation (public: GitHub API 200). Data cached at MyDrive/btp_quick_results/data, outputs at MyDrive/btp_quick_results/outputs and copied to quick_results/outputs.
+- Verified by: notebook JSON loads (22 cells); `run_all.py --steps ""` (download-only path, no download) exits 0. Notebook not executed (Colab only).
+- Assumptions / risks: E4 needs Colab secret HF_TOKEN with approved Llama-3.1 access. Default ALLOW_GATE_FAIL=False stops before E2 if the std gate fails (likely, Qd_min).
+- Commit: "quick_results: Colab notebook and README (document.md)"
