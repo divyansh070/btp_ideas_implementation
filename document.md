@@ -28,7 +28,6 @@
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
 - quick_results E3: HNEI (NMC-LCO) is always a source cell; its components {NMC, LCO} give held-out NMC and LCO a partial cathode match, so only the LFP and NCA folds have no matching expert. Neural ODE omitted.
 - quick_results: other possibly-constant features, NOT dropped, awaiting user decision. `Qd_median` is constant by construction if Qd is 0 during charge and charge takes ≥ 50 % of a cycle's samples (likely, unverified on real data). Inside one cell, protocol-fixed features (`V_max`, `I_C_min`, `I_C_max`, `I_C_median`) and their deltas barely move; they vary across cells, so the std gate does not catch them. E0 now writes `e0_feature_constancy.csv` to settle this on real data.
-- quick_results: the old downloader (urllib, no resume/checksum) is still in qr/data.py. Colab hit ContentTooShortError on SNL.zip (49,816,600 of 114,385,726 bytes). The requested requests+Range-resume+md5 fix was interrupted before any edit and is still TODO.
 
 ## Log
 
@@ -157,3 +156,11 @@
 - Changed: quick_results/run_all.py (E0: drop policy + warning, gate row "cells dropped: no prompt embedding", e0_dropped_cells.csv with all dropped cells and reasons, REPORT setup lists them), configs/quick.yaml (data.text_embedding_missing: drop), tests/test_smoke.py (test_missing_prompt_embedding: drop mode lists the cell, error mode raises). prepare() still raises on a missing embedding, so error mode needed no new code.
 - Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 3 passed, 1 skipped (LightGBM, macOS), 4.7 s.
 - Commit: "quick_results: drop cells without prompt embedding (document.md)"
+
+### 2026-11-21 17:59 — quick_results: resumable, checksum-verified downloads (Colab ContentTooShortError)
+- Error (Colab, download step): `urllib.error.ContentTooShortError` on SNL.zip, 49,816,600 of 114,385,726 bytes. Zenodo dropped the connection and urlretrieve had no resume or retry.
+- Changed: quick_results/qr/data.py (new `remote_meta()` reads size + md5 for every file from the Zenodo record API (17958489, 17972780) and figshare's files API (31148413), 3 tries, empty on failure; new `fetch()` replaces `_fetch`: requests streaming into `<dest>.tmp`, HTTP Range resume, up to 10 attempts with backoff 2,4,8,... capped at 60 s, size check against record size or Content-Length / Content-Range total, md5 check, rename only after both pass. A dest whose size matches is skipped; a wrong-size dest is resumed or discarded. A failed md5 deletes the .tmp and restarts). `download()` passes each file's size/md5. requirements.txt: requests>=2.28 (preinstalled on Colab). tests/test_smoke.py: test_fetch_resumes_and_verifies (loopback server that cuts the first response at half, then serves Range/206).
+- Failed attempt: the first version resumed at 0 instead of 150,000. `iter_content(1 MB)` buffers a whole chunk, so the bytes of an unfinished chunk are never written. Fix: chunk = 64 KB (at most 64 KB lost per cut); the test now asserts a real resume offset (147,456).
+- Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 4 passed, 1 skipped (LightGBM, macOS), 5.8 s. Loopback log: cut at 150,000 → "resuming at 147456 of 300000" → "OK (300000 bytes, md5 verified)"; rerun "present ... size verified, skipping"; bad md5 → RuntimeError after 2 attempts, no file renamed. `remote_meta()` against the live APIs (metadata only) returns size + md5 for SNL, CALCE, HNEI, HUST, Life labels, prompt embeddings and PBT_checkpoints.
+- Assumptions / risks: assumes Zenodo honours Range on /files/<name>/content. If it ignores Range, the code restarts the file rather than corrupting it. Not yet exercised against Zenodo itself (no data downloads on this Mac).
+- Commit: "quick_results: resumable checksum-verified downloads (document.md)"

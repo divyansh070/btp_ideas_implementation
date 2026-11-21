@@ -99,3 +99,56 @@ def test_missing_prompt_embedding(tmp_path):
     cfg["data"]["text_embedding_missing"] = "error"
     with pytest.raises(KeyError, match="no prompt embedding"):
         run_all.main(["--data", str(data), "--out", str(tmp_path / "out2"), "--steps", "e0"], cfg=cfg)
+
+
+def _flaky_server(payload, cut_first=True):
+    """Loopback HTTP server: first GET advertises the full length but sends half and drops (like Zenodo did);
+    later GETs honour 'Range: bytes=N-' with 206. Returns (base_url, list of Range headers seen, server)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            seen.append(rng)
+            start = int(rng.split("=")[1].rstrip("-")) if rng else 0
+            body = payload[start:]
+            self.send_response(206 if rng else 200)
+            if rng:
+                self.send_header("Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if cut_first and len(seen) == 1:
+                self.wfile.write(body[: len(body) // 2])
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}/f.zip", seen, srv
+
+
+def test_fetch_resumes_and_verifies(tmp_path):
+    import hashlib
+    payload = np.random.default_rng(0).bytes(300_000)
+    md5 = hashlib.md5(payload).hexdigest()
+    url, seen, srv = _flaky_server(payload)
+    try:
+        dest = qd.fetch(url, tmp_path / "f.zip", size=None, md5=md5, retries=4, backoff=0, chunk=8192)  # size from Content-Length
+        assert dest.read_bytes() == payload and not (tmp_path / "f.zip.tmp").exists()
+        offset = int(seen[1].split("=")[1].rstrip("-"))
+        assert seen[0] is None and 0 < offset <= 150_000                # second request resumed the partial .tmp
+        n = len(seen)
+        qd.fetch(url, dest, size=len(payload), md5=md5)                 # complete, size-verified: skipped
+        assert len(seen) == n
+        with pytest.raises(RuntimeError, match="failed after 2 attempts"):  # wrong checksum is never renamed
+            qd.fetch(url, tmp_path / "g.zip", size=len(payload), md5="0" * 32, retries=2, backoff=0)
+        assert not (tmp_path / "g.zip").exists()
+    finally:
+        srv.shutdown()

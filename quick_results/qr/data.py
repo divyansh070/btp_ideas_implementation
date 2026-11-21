@@ -5,10 +5,11 @@ Pickle format and label rule are ported from third_party/PBT (commit 74f03a7):
     charge_capacity_in_Ah, discharge_capacity_in_Ah, time_in_s, cycle_number}, ... ]}  (data_provider/data_loader.py:1049-1061)
   - EOL rule: process_scripts/extract_life_labels.py:20-63
 """
+import hashlib
 import json
 import pickle
 import re
-import urllib.request
+import time
 import zipfile
 from pathlib import Path
 
@@ -17,6 +18,8 @@ import numpy as np
 ZENODO_DATA = "https://zenodo.org/api/records/17958489/files/{}.zip/content"    # BatteryLife v9, per-dataset zips
 FIGSHARE_LABELS = "https://ndownloader.figshare.com/files/63780003"             # figshare 31148413, "Life labels.zip"
 ZENODO_PBT = "https://zenodo.org/api/records/17972780/files/{}/content"         # PBT ckpt + prompt embeddings
+ZENODO_RECORD = "https://zenodo.org/api/records/{}"                             # file sizes + md5
+FIGSHARE_FILES = "https://api.figshare.com/v2/articles/{}/files"
 PREFIX = {"SNL": "SNL_", "CALCE": "CALCE_", "HNEI": "HNEI_", "HUST": "HUST_"}
 EMB_FILES = [f"{s}_DKP_embed_all_Llama.pkl" for s in ("training", "validation", "testing")]
 STATS = ("mean", "std", "min", "max", "var", "median")
@@ -24,13 +27,92 @@ SIGNALS = ("V", "I_C", "Qd")
 
 
 # ---------------------------------------------------------------- download (Colab)
-def _fetch(url, dest):
+def remote_meta():
+    """{file name: (size, md5)} from the Zenodo and figshare APIs. Empty on failure (then Content-Length is the only check)."""
+    import requests
+    meta = {}
+    for attempt in range(3):
+        try:
+            for rec in ("17958489", "17972780"):
+                for f in requests.get(ZENODO_RECORD.format(rec), timeout=60).json()["files"]:
+                    meta[f["key"]] = (int(f["size"]), f["checksum"].removeprefix("md5:"))
+            for f in requests.get(FIGSHARE_FILES.format("31148413"), timeout=60).json():
+                meta[f["name"]] = (int(f["size"]), f.get("computed_md5") or f.get("supplied_md5"))
+            return meta
+        except Exception as e:  # metadata is a check, not a requirement
+            print(f"WARNING: file metadata lookup failed ({type(e).__name__}: {e}), attempt {attempt + 1}/3", flush=True)
+            time.sleep(2 * (attempt + 1))
+    return {}
+
+
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _total_from(r, have):
+    if r.status_code == 206:  # Content-Range: bytes <start>-<end>/<total>
+        tot = r.headers.get("Content-Range", "").rpartition("/")[2]
+        return int(tot) if tot.isdigit() else None
+    n = r.headers.get("Content-Length")
+    return int(n) if n and n.isdigit() else None
+
+
+def fetch(url, dest, size=None, md5=None, retries=10, backoff=2.0, chunk=1 << 16):
+    """Streaming download with HTTP Range resume of <dest>.tmp, retries with exponential backoff,
+    size check against the record size / Content-Length and an md5 check before the rename.
+    A finished dest whose size matches is skipped. Bytes of an unfinished chunk are lost on a cut (<= chunk)."""
+    import requests
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + ".tmp")
     if dest.exists():
-        return
-    print(f"downloading {url} -> {dest}", flush=True)
-    tmp = dest.with_suffix(".part")
-    urllib.request.urlretrieve(url, tmp)
-    tmp.rename(dest)
+        if size is None or dest.stat().st_size == size:
+            print(f"{dest.name}: present ({dest.stat().st_size} bytes{', size verified' if size else ''}), skipping", flush=True)
+            return dest
+        print(f"{dest.name}: size {dest.stat().st_size} != expected {size}, resuming", flush=True)
+        dest.replace(tmp) if dest.stat().st_size < size else dest.unlink()
+    expected = size
+    for attempt in range(1, retries + 1):
+        have = tmp.stat().st_size if tmp.exists() else 0
+        try:
+            if expected is None or have < expected:
+                if expected is not None and have > expected:
+                    tmp.unlink()
+                    have = 0
+                headers = {"Range": f"bytes={have}-"} if have else {}
+                with requests.get(url, headers=headers, stream=True, timeout=(30, 120)) as r:
+                    if r.status_code == 416 and expected is not None and have == expected:
+                        pass  # already complete
+                    else:
+                        r.raise_for_status()
+                        if have and r.status_code != 206:  # server ignored the Range header: restart
+                            have = 0
+                        expected = expected or _total_from(r, have)
+                        print(f"{dest.name}: {'resuming at ' + str(have) if have else 'downloading'} "
+                              f"of {expected} bytes (attempt {attempt}/{retries})", flush=True)
+                        with open(tmp, "ab" if have else "wb") as f:
+                            for b in r.iter_content(chunk):
+                                f.write(b)
+            got = tmp.stat().st_size
+            if expected is not None and got != expected:
+                raise IOError(f"short download: {got} of {expected} bytes")
+            if expected is None:
+                print(f"WARNING: {dest.name}: no size known, cannot verify length", flush=True)
+            if md5 and _md5(tmp) != md5:
+                tmp.unlink()  # corrupt, not merely short: start over
+                raise IOError(f"md5 mismatch (expected {md5})")
+            tmp.replace(dest)
+            print(f"{dest.name}: OK ({got} bytes{', md5 verified' if md5 else ''})", flush=True)
+            return dest
+        except (requests.RequestException, IOError) as e:
+            wait = min(backoff * 2 ** (attempt - 1), 60)
+            print(f"{dest.name}: attempt {attempt}/{retries} failed: {type(e).__name__}: {e}; retry in {wait:.0f}s", flush=True)
+            if attempt < retries:
+                time.sleep(wait)
+    raise RuntimeError(f"{dest.name}: download failed after {retries} attempts ({url})")
 
 
 def _extract_flat(zpath, out_dir, keep):
@@ -56,18 +138,22 @@ def download(root, datasets, pbt_ckpt=False):
     root = Path(root)
     raw = root / "raw"
     raw.mkdir(parents=True, exist_ok=True)
+    meta = remote_meta()
+
+    def get(url, dest, key):
+        size, md5 = meta.get(key, (None, None))
+        return fetch(url, dest, size, md5)
+
     for ds in datasets:
-        z = raw / f"{ds}.zip"
-        _fetch(ZENODO_DATA.format(ds), z)
+        z = get(ZENODO_DATA.format(ds), raw / f"{ds}.zip", f"{ds}.zip")
         print(ds, _extract_flat(z, root / ds, lambda n, p=PREFIX[ds]: n.startswith(p) and n.endswith(".pkl")), "cells")
-    _fetch(FIGSHARE_LABELS, raw / "life_labels.zip")
+    get(FIGSHARE_LABELS, raw / "life_labels.zip", "Life labels.zip")
     wanted = {f"{ds}_labels.json" for ds in datasets}
     _extract_flat(raw / "life_labels.zip", root / "Life labels", lambda n: n in wanted)
-    _fetch(ZENODO_PBT.format("aging_condition_prompt_embeddings.zip"), raw / "embeddings.zip")
+    get(ZENODO_PBT.format("aging_condition_prompt_embeddings.zip"), raw / "embeddings.zip", "aging_condition_prompt_embeddings.zip")
     _extract_flat(raw / "embeddings.zip", root / "embeddings", lambda n: n in EMB_FILES)
     if pbt_ckpt:
-        z = raw / "PBT_checkpoints.zip"
-        _fetch(ZENODO_PBT.format("PBT_checkpoints.zip"), z)
+        z = get(ZENODO_PBT.format("PBT_checkpoints.zip"), raw / "PBT_checkpoints.zip", "PBT_checkpoints.zip")
         if not (root / "pbt_ckpt").exists():
             with zipfile.ZipFile(z) as f:
                 f.extractall(root / "pbt_ckpt")  # zipfile strips absolute paths and '..'
