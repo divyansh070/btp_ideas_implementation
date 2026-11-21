@@ -66,3 +66,19 @@
 - Model init needs, even with cached embeddings: Llama **tokenizer + config** from `LLM_path` with `local_files_only=True` (`models/PBT.py:487-493`, `finetune_model.py:595`) and a PCA pickle `pca_path` (`models/PBT.py:519`). So the gated HF access is still required (small files only), and `MIX_large_pca_0.99_Llama.pkl` must ship with the ckpt or be regenerated → check once the ckpt is downloaded.
 - Assumptions / risks: line numbers valid for commit 74f03a7 only. Zenodo/HF sizes are from public API metadata, not downloads.
 - Commit: "docs: PBT repo audit, answers to open questions b-f (document.md)"
+
+### 2026-11-21 16:22 — Python env for PBT (uv, .venv)
+- Changed: `.venv/` (gitignored, 905 MB), `requirements.lock` (new, `uv pip freeze`, 85 pkgs)
+- Why: brief step 3; guide §5 A1.
+- How: `uv venv --python 3.11 .venv` then `uv pip install -r <PBT requirements.txt minus BatteryML> wandb denseweight huggingface_hub`. Tool = **uv** 0.10.8, Python 3.11.4 (pins need ≥3.11). BatteryML dropped: not on PyPI, only used in a docstring (`third_party/PBT/data_provider/data_loader.py:25`), so `data_loader.py` will need a stubbed import or `pip install git+https://github.com/microsoft/BatteryML --no-deps` when first imported. Not done yet.
+- Verified by: `.venv/bin/python -c "import torch, transformers, accelerate, peft, numpy, sklearn, scipy, wandb, denseweight, reformer_pytorch"` → torch 2.4.1, transformers 4.44.2, accelerate 1.1.1, numpy 2.3.5, sklearn 1.8.0. MPS available, CUDA not. bf16 Linear+softmax OK on CPU and MPS. `Accelerator(mixed_precision='bf16')` **FAILS on MPS** ("bf16 mixed precision requires ... a supported device"); `mixed_precision='no'` → device mps OK. PBT casts to bf16 itself (`models/PBT.py:587-588`), so on Mac launch with `--mixed_precision no`.
+- Hardware: Apple M1, 8 GB unified memory, macOS 26.5.1, 34 GB disk free.
+- Can it run here?
+  - Llama-3.1-8B embedding: **not on this Mac.** bf16 weights are 16.07 GB (> 8 GB RAM). The PBT recipe loads it with `load_in_4bit=True` (bitsandbytes, CUDA-only). Needs a CUDA GPU (≥16 GB VRAM for bf16, or e.g. a T4 with 4-bit). Only needed if we embed new prompts: Zenodo already ships PBT's embeddings (6 MB) for its pretraining cells, which include all 8 of our datasets. Re-embedding must reuse the same 4-bit recipe or the vectors won't match what the ckpt was trained with.
+  - PBT fine-tuning: model is small (d_model 128). Small datasets (CALCE, HNEI, UL-PUR) are **plausible on MPS/CPU** (untested until weights are downloaded). MATR-scale fine-tuning and hparam sweeps × 3 seeds need a CUDA GPU: the loader keeps every sample's curves in RAM, and MATR train is roughly 102 cells × ~100 samples × 100 cycles × 900 floats × 4 B ≈ 3.7 GB (estimate).
+- Sizes / access (nothing downloaded):
+  - PBT weights, Zenodo 17972780: open, CC-BY-4.0, no request needed. `PBT_checkpoints.zip` 208 MB + `aging_condition_prompt_embeddings.zip` 6 MB.
+  - Llama-3.1-8B-Instruct, HF `meta-llama/Llama-3.1-8B-Instruct`: gated, **manual approval**. Request on the HF model page (accept the Llama 3.1 Community License with your HF account), then create a read token for `.env`. Weights: 4 safetensors = 16.07 GB (skip the duplicate `original/` 16.06 GB). Needed even with cached embeddings for tokenizer/config (a few MB).
+  - BatteryLife v9 data, Zenodo 17958489: open, our 8 datasets = 8.01 GB (> 1 GB → ask before downloading). Life labels: figshare 31148413, open.
+- Assumptions / risks: MPS fine-tune feasibility and the RAM estimate are untested.
+- Commit: "env: uv venv for PBT, requirements.lock (document.md)"
