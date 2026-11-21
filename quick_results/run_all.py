@@ -57,8 +57,20 @@ def e0(cfg, data_dir, out):
     ds = cfg["data"]["datasets"]
     cells, kept = qd.load_cells(data_dir, ds, cfg["data"]["min_cycles"])
     text = qd.load_text_embeddings(data_dir)
-    prep = prepare(kept, text, cfg["data"]["window"], cfg["data"]["sampled"], cfg["data"]["max_windows_per_cell"])
+    no_text = [c for c in kept if c["name"] not in text]
+    if no_text and cfg["data"]["text_embedding_missing"] == "drop":
+        # PBT only embedded cells in its own splits (e.g. SNL NCA 20-80 _a/_b); never zero-fill like PBT does
+        print(f"WARNING: dropping {len(no_text)} cells with no prompt embedding: {[c['name'] for c in no_text]}", flush=True)
+        for c in no_text:
+            c["drop"] = "no_prompt_embedding"
+        kept = [c for c in kept if c["drop"] == ""]
+    prep = prepare(kept, text, cfg["data"]["window"], cfg["data"]["sampled"], cfg["data"]["max_windows_per_cell"])  # mode error: raises here
     gate = run_gate(cells, kept, prep, qd.load_pbt_labels(data_dir, ds), cfg)
+    dropped_text = [c["name"] for c in cells if c["drop"] == "no_prompt_embedding"]
+    gate.insert(0, dict(check="cells dropped: no prompt embedding", value=len(dropped_text), passed=True,
+                        detail=", ".join(dropped_text)))
+    pd.DataFrame([dict(name=c["name"], chem=c["chem"], dataset=c["dataset"], reason=c["drop"])
+                  for c in cells if c["drop"]], columns=["name", "chem", "dataset", "reason"]).to_csv(out / "e0_dropped_cells.csv", index=False)
     raw = pd.DataFrame([dict(chem=c["chem"], dataset=c["dataset"], drop=c["drop"]) for c in cells])
     tab = raw.groupby(["chem", "dataset"]).agg(raw_cells=("drop", "size"), kept_cells=("drop", lambda s: (s == "").sum()))
     w = pd.DataFrame(prep["cells"]).groupby(["chem", "dataset"]).agg(
@@ -233,6 +245,10 @@ def report(cfg, out):
           "- Selection: best epoch on validation cells only (source val for zero-shot; source val + target val otherwise). "
           "The blind test is only scored.",
           f"- Runtime (s): {rt}; host: {platform.node()} / torch device {T.DEV}.", ""]
+    if (out / "e0_dropped_cells.csv").exists():
+        dr = pd.read_csv(out / "e0_dropped_cells.csv")
+        L += [f"Dropped cells ({len(dr)}; missing prompt embeddings: policy `{cfg['data']['text_embedding_missing']}`):", "",
+              md_table(dr) if len(dr) else "none", ""]
     rows = []
     for held in cfg["folds"]:
         sp = make_split(prep["chem"], held, cfg["seeds"][0], cfg["split"])

@@ -9,6 +9,7 @@
 - 2026-11-21 — Approved: the gate's feature-range check uses the 1st–99th percentile of each scaled target (val+test) feature, not strict min/max. Zero-shot uses a source-only scaler because no target cells exist.
 - 2026-11-21 — Approved: E3 expert sets are 'LFP vs rest' of the fold's source, and 'NMC vs rest' when LFP is held out.
 - 2026-11-21 — Notebook default USE_HUST=True (+77 LFP cells, 1.39 GB).
+- 2026-11-21 — quick_results: cells without a PBT prompt embedding are dropped (config `data.text_embedding_missing: drop|error`, default drop), never zero-filled. They are listed in e0_dropped_cells.csv, REPORT setup and the gate table.
 
 ## Known issues / open questions
 - (a) How is EOL obtained at inference to turn predicted fraction-of-life back into cycles? True EOL at test time is a leak (guide §3, §6.9, Part 4 item 6). Options: estimate, separate EOL predictor, or predict RUL in cycles directly. **Must be decided before any fraction-of-life training.** Not blocking Track A (A3 re-head can predict RUL in cycles).
@@ -27,6 +28,7 @@
 - Seeds: guide's metrics section says 10, PBT uses 3. Plan proposes 3 for A2, 10 for A5.
 - quick_results E3: HNEI (NMC-LCO) is always a source cell; its components {NMC, LCO} give held-out NMC and LCO a partial cathode match, so only the LFP and NCA folds have no matching expert. Neural ODE omitted.
 - quick_results: other possibly-constant features, NOT dropped, awaiting user decision. `Qd_median` is constant by construction if Qd is 0 during charge and charge takes ≥ 50 % of a cycle's samples (likely, unverified on real data). Inside one cell, protocol-fixed features (`V_max`, `I_C_min`, `I_C_max`, `I_C_median`) and their deltas barely move; they vary across cells, so the std gate does not catch them. E0 now writes `e0_feature_constancy.csv` to settle this on real data.
+- quick_results: the old downloader (urllib, no resume/checksum) is still in qr/data.py. Colab hit ContentTooShortError on SNL.zip (49,816,600 of 114,385,726 bytes). The requested requests+Range-resume+md5 fix was interrupted before any edit and is still TODO.
 
 ## Log
 
@@ -148,3 +150,10 @@
 - Verified by: `.venv/bin/python -c "from qr.features import N_FEAT; print(N_FEAT)"` → 28. `.venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 2 passed, 1 skipped (LightGBM, macOS), 4.6 s. Constancy table on synthetic cells flags Qd_median, I_C_mean, I_C_median, V_max, d_I_C_mean: mostly artefacts of the symmetric synthetic cycles; real data decides.
 - Assumptions / risks: the HUST default roughly doubles the window count. The < 1 h T4 estimate is unverified.
 - Commit: "quick_results: drop Qd_min, feature constancy table, HUST default (document.md)"
+
+### 2026-11-21 17:56 — quick_results: drop cells without a prompt embedding (Colab E0 KeyError)
+- Error (Colab E0): `KeyError: 2 cells have no prompt embedding: SNL_18650_NCA_25C_20-80_0.5-0.5C_a, _b` from qr/features.py prepare().
+- Root cause: no naming mismatch. PBT has prompts for both cells under the same names (third_party/PBT/Prompts/Mapping_helper.py:333-334, SNL_protocol_prompt.py:363,375), but they are in no split list in data_provider/data_split_recorder.py (only _c train, _d val are). PBT's notebook embeds only split cells (generate_aging_condition_pretraining.ipynb cell 3), so they never got a vector. Nothing to map. Our filters keep them, PBT's split does not; dropping them brings NCA back to PBT's 20. Why PBT excludes them is unknown (not in its split; possibly a label or curve issue). Check e0_cell_list.csv for their EOL in Colab.
+- Changed: quick_results/run_all.py (E0: drop policy + warning, gate row "cells dropped: no prompt embedding", e0_dropped_cells.csv with all dropped cells and reasons, REPORT setup lists them), configs/quick.yaml (data.text_embedding_missing: drop), tests/test_smoke.py (test_missing_prompt_embedding: drop mode lists the cell, error mode raises). prepare() still raises on a missing embedding, so error mode needed no new code.
+- Verified by: `cd quick_results && .venv/bin/python -m pytest -v -p no:cacheprovider tests/test_smoke.py` → 3 passed, 1 skipped (LightGBM, macOS), 4.7 s.
+- Commit: "quick_results: drop cells without prompt embedding (document.md)"

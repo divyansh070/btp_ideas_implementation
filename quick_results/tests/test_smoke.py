@@ -78,3 +78,24 @@ def test_lgbm(tmp_path):
     test = window_idx(prep, sp["test"])
     p = fit_lgbm(prep, regime_sets(sp, "zero_shot"), cfg["e2"]["lgbm"], 0).predict(prep["X"][test, -1])
     assert np.isfinite(p).all()
+
+
+def test_missing_prompt_embedding(tmp_path):
+    import pickle
+    data = tmp_path / "data"
+    qd.make_synthetic(data)
+    emb_file = data / "embeddings" / qd.EMB_FILES[0]
+    emb = pickle.loads(emb_file.read_bytes())
+    gone = "SNL_18650_NCA_35C_0-100_0.5-2C_b"
+    del emb[gone]
+    emb_file.write_bytes(pickle.dumps(emb))
+    cfg = smoke_cfg()
+    run_all.main(["--data", str(data), "--out", str(tmp_path / "out"), "--steps", "e0"], cfg=cfg)
+    dropped = pd.read_csv(tmp_path / "out" / "e0_dropped_cells.csv")
+    assert dropped.to_dict("records") == [dict(name=gone, chem="NCA", dataset="SNL", reason="no_prompt_embedding")]
+    gate = pd.read_csv(tmp_path / "out" / "e0_gate.csv").set_index("check")
+    assert int(gate.loc["cells dropped: no prompt embedding", "value"]) == 1
+    assert not gate.loc["count NCA", "passed"]                       # 1 of 2 expected NCA cells left
+    cfg["data"]["text_embedding_missing"] = "error"
+    with pytest.raises(KeyError, match="no prompt embedding"):
+        run_all.main(["--data", str(data), "--out", str(tmp_path / "out2"), "--steps", "e0"], cfg=cfg)

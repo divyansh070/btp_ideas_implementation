@@ -8,6 +8,7 @@ data:
   sampled: 10                    # cycles sampled evenly from the window
   max_windows_per_cell: 150      # stride-1 windows, evenly subsampled to this many per cell (runtime)
   min_cycles: 100
+  text_embedding_missing: drop   # drop | error. drop: cells without a PBT prompt embedding are removed and listed in REPORT
 
 # Gate count check. Defaults = PBT's post-filter split counts (document.md, Phase 0 audit).
 expected_counts: {LFP: 9, NMC: 21, NCA: 20, LCO: 13, NMC-LCO: 14}
